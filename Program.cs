@@ -46,6 +46,7 @@ internal sealed class PreviewForm : Form
     {
         currentDeviceSelector = deviceSelector;
 
+        KeyPreview = true;
         Text = "CaptureCardPlayer";
         BackColor = Color.Black;
         ClientSize = new Size(1280, 720);
@@ -69,6 +70,7 @@ internal sealed class PreviewForm : Form
         previewHost.Resize += (_, _) => graph?.Resize(previewHost.ClientSize);
         previewHost.MenuRequested += (_, point) => ShowDeviceMenu(point);
         previewHost.WheelRequested += (_, delta) => ChangeVolume(delta);
+        previewHost.ShortcutRequested += (_, shortcut) => HandleShortcut(shortcut);
         MouseWheel += (_, e) => ChangeVolume(e.Delta);
         statusLabel.MouseUp += (_, e) =>
         {
@@ -78,6 +80,16 @@ internal sealed class PreviewForm : Form
             }
         };
         statusLabel.MouseWheel += (_, e) => ChangeVolume(e.Delta);
+    }
+
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (HandleShortcut(keyData))
+        {
+            return true;
+        }
+
+        return base.ProcessCmdKey(ref msg, keyData);
     }
 
     protected override void OnShown(EventArgs e)
@@ -126,6 +138,75 @@ internal sealed class PreviewForm : Form
         graph?.SetVolumePercent(volumePercent);
         UpdateWindowTitle();
         DiagnosticLog.Write($"Volume changed: {volumePercent}%.");
+    }
+
+    private bool HandleShortcut(Keys keyData)
+    {
+        if (keyData == (Keys.Control | Keys.C))
+        {
+            CopyCurrentFrameToClipboard();
+            return true;
+        }
+
+        if (keyData == (Keys.Control | Keys.E))
+        {
+            SaveCurrentFrameToPictures();
+            return true;
+        }
+
+        return false;
+    }
+
+    private void CopyCurrentFrameToClipboard()
+    {
+        try
+        {
+            using Bitmap frame = CapturePreviewArea();
+            Clipboard.SetImage((Bitmap)frame.Clone());
+            DiagnosticLog.Write("Current frame copied to clipboard.");
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"Failed to copy current frame: {ex}");
+        }
+    }
+
+    private void SaveCurrentFrameToPictures()
+    {
+        try
+        {
+            using Bitmap frame = CapturePreviewArea();
+            string picturesPath = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures);
+            if (string.IsNullOrWhiteSpace(picturesPath))
+            {
+                picturesPath = AppContext.BaseDirectory;
+            }
+
+            Directory.CreateDirectory(picturesPath);
+
+            string fileName = $"CaptureCardPlayer_{DateTime.Now:yyyyMMdd_HHmmss_fff}.png";
+            string filePath = Path.Combine(picturesPath, fileName);
+            frame.Save(filePath, System.Drawing.Imaging.ImageFormat.Png);
+            DiagnosticLog.Write($"Current frame saved: {filePath}");
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"Failed to save current frame: {ex}");
+        }
+    }
+
+    private Bitmap CapturePreviewArea()
+    {
+        Rectangle bounds = previewHost.RectangleToScreen(previewHost.ClientRectangle);
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+        {
+            throw new InvalidOperationException("Preview area is empty.");
+        }
+
+        var bitmap = new Bitmap(bounds.Width, bounds.Height);
+        using Graphics graphics = Graphics.FromImage(bitmap);
+        graphics.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size, CopyPixelOperation.SourceCopy);
+        return bitmap;
     }
 
     private void UpdateWindowTitle()
@@ -195,10 +276,12 @@ internal sealed class PreviewForm : Form
 internal sealed class PreviewPanel : Panel
 {
     private const int WmContextMenu = 0x007B;
+    private const int WmKeyDown = 0x0100;
     private const int WmMouseWheel = 0x020A;
 
     public event EventHandler<Point>? MenuRequested;
     public event EventHandler<int>? WheelRequested;
+    public event EventHandler<Keys>? ShortcutRequested;
 
     protected override void WndProc(ref Message m)
     {
@@ -214,6 +297,16 @@ internal sealed class PreviewPanel : Panel
             int delta = unchecked((short)(((long)m.WParam >> 16) & 0xFFFF));
             WheelRequested?.Invoke(this, delta);
             return;
+        }
+
+        if (m.Msg == WmKeyDown)
+        {
+            Keys shortcut = (Keys)(int)m.WParam | ModifierKeys;
+            if (shortcut is (Keys.Control | Keys.C) or (Keys.Control | Keys.E))
+            {
+                ShortcutRequested?.Invoke(this, shortcut);
+                return;
+            }
         }
 
         base.WndProc(ref m);
