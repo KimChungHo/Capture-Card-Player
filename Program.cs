@@ -84,13 +84,16 @@ internal sealed class PreviewForm : Form
     {
         try
         {
+            DiagnosticLog.Write("Starting preview.");
             graph = DirectShowPreviewGraph.Start(previewHost.Handle, previewHost.ClientSize, deviceSelector);
             statusLabel.Visible = false;
             Text = $"CaptureCardPlayer - {graph.DeviceName}";
+            DiagnosticLog.Write($"Preview started: {graph.DeviceName}");
         }
         catch (Exception ex)
         {
-            statusLabel.Text = ex.Message;
+            DiagnosticLog.Write(ex.ToString());
+            statusLabel.Text = $"{ex.Message}{Environment.NewLine}{Environment.NewLine}Log: {DiagnosticLog.Path}";
             statusLabel.Visible = true;
             graph?.Dispose();
             graph = null;
@@ -182,17 +185,22 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
     private void Build(IntPtr owner, Size size, string? deviceSelector)
     {
+        DiagnosticLog.Write("Creating FilterGraph.");
         graphBuilder = CreateComObject<IGraphBuilder>(DirectShowGuids.FilterGraph);
+        DiagnosticLog.Write("Creating CaptureGraphBuilder2.");
         captureBuilder = CreateComObject<ICaptureGraphBuilder2>(DirectShowGuids.CaptureGraphBuilder2);
 
         CheckHr(captureBuilder.SetFiltergraph(graphBuilder), "Failed to initialize the DirectShow graph.");
 
+        DiagnosticLog.Write("Binding video capture device.");
         sourceFilter = VideoCaptureDevices.Bind(deviceSelector, out string deviceName);
         DeviceName = deviceName;
+        DiagnosticLog.Write($"Selected device: {deviceName}");
 
         var filterGraph = (IFilterGraph)graphBuilder;
         CheckHr(filterGraph.AddFilter(sourceFilter, deviceName), "Failed to add the capture device to the graph.");
 
+        DiagnosticLog.Write("Creating VideoRenderer.");
         rendererFilter = CreateComObject<IBaseFilter>(DirectShowGuids.VideoRenderer);
         CheckHr(filterGraph.AddFilter(rendererFilter, "Video Renderer"), "Failed to add the video renderer.");
 
@@ -207,6 +215,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
         CheckHr(hr, "Failed to render the video capture stream.");
 
+        DiagnosticLog.Write("Attaching video window.");
         mediaControl = (IMediaControl)graphBuilder;
         videoWindow = (IVideoWindow)graphBuilder;
 
@@ -216,6 +225,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         Resize(size);
         CheckHr(videoWindow.put_Visible(OaTrue), "Failed to show the video output window.");
 
+        DiagnosticLog.Write("Running graph.");
         CheckHr(mediaControl.Run(), "Failed to start the video capture device.");
     }
 
@@ -248,9 +258,21 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
     private static void ReleaseComObject(object? value)
     {
-        if (value is not null && Marshal.IsComObject(value))
+        if (value is null)
         {
-            Marshal.FinalReleaseComObject(value);
+            return;
+        }
+
+        try
+        {
+            if (Marshal.IsComObject(value))
+            {
+                Marshal.FinalReleaseComObject(value);
+            }
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"Ignoring COM release failure: {ex}");
         }
     }
 
@@ -363,6 +385,27 @@ internal static class DirectShowGuids
     public static readonly Guid CaptureGraphBuilder2 = new("BF87B6E1-8C27-11D0-B3F0-00AA003761C5");
     public static readonly Guid CreateDevEnum = new("62BE5D10-60EB-11D0-BD3B-00A0C911CE86");
     public static readonly Guid VideoRenderer = new("70E102B0-5556-11CE-97C0-00AA0055595A");
+}
+
+internal static class DiagnosticLog
+{
+    public static string Path { get; } = System.IO.Path.Combine(
+        AppContext.BaseDirectory,
+        "CaptureCardPlayer.log");
+
+    public static void Write(string message)
+    {
+        try
+        {
+            File.AppendAllText(
+                Path,
+                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}{Environment.NewLine}");
+        }
+        catch
+        {
+            // Logging must never stop preview startup or cleanup.
+        }
+    }
 }
 
 [ComImport]
