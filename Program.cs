@@ -1,5 +1,4 @@
 using System.Runtime.InteropServices;
-using System.Runtime.InteropServices.ComTypes;
 
 namespace CaptureCardPlayer;
 
@@ -289,8 +288,8 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         public static IBaseFilter Bind(string? selector, out string deviceName)
         {
             ICreateDevEnum? createDevEnum = null;
-            IEnumMoniker? enumMoniker = null;
-            var monikers = new List<IMoniker>();
+            INativeEnumMoniker? enumMoniker = null;
+            var monikers = new List<INativeMoniker>();
 
             try
             {
@@ -307,12 +306,10 @@ internal sealed class DirectShowPreviewGraph : IDisposable
                 CheckHr(hr, "Failed to enumerate video capture devices.");
 
                 DiagnosticLog.Write("Reading monikers.");
-                var current = new IMoniker[1];
-                while (enumMoniker.Next(1, current, IntPtr.Zero) == HrSuccess)
+                while (enumMoniker.Next(1, out INativeMoniker current, IntPtr.Zero) == HrSuccess)
                 {
                     DiagnosticLog.Write("Found video capture moniker.");
-                    monikers.Add(current[0]);
-                    current = new IMoniker[1];
+                    monikers.Add(current);
                 }
 
                 if (monikers.Count == 0)
@@ -324,7 +321,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
                 List<string> failures = new();
                 foreach (int selectedIndex in BuildCandidateOrder(monikers, selector))
                 {
-                    IMoniker selected = monikers[selectedIndex];
+                    INativeMoniker selected = monikers[selectedIndex];
                     string candidateName = GetFriendlyName(selected) ?? $"Video Capture Device {selectedIndex}";
                     DiagnosticLog.Write($"Trying device {selectedIndex}: {candidateName}.");
 
@@ -332,10 +329,21 @@ internal sealed class DirectShowPreviewGraph : IDisposable
                     {
                         Guid baseFilterId = typeof(IBaseFilter).GUID;
                         DiagnosticLog.Write("Binding selected moniker to IBaseFilter.");
-                        selected.BindToObject(null!, null!, ref baseFilterId, out object sourceObject);
+                        CheckHr(
+                            selected.BindToObject(IntPtr.Zero, IntPtr.Zero, ref baseFilterId, out IntPtr sourcePointer),
+                            $"Failed to bind {candidateName} to IBaseFilter.");
                         DiagnosticLog.Write("Selected moniker bound to IBaseFilter.");
-                        deviceName = candidateName;
-                        return (IBaseFilter)sourceObject;
+
+                        try
+                        {
+                            object sourceObject = Marshal.GetObjectForIUnknown(sourcePointer);
+                            deviceName = candidateName;
+                            return (IBaseFilter)sourceObject;
+                        }
+                        finally
+                        {
+                            Marshal.Release(sourcePointer);
+                        }
                     }
                     catch (Exception ex) when (ex is COMException or InvalidComObjectException)
                     {
@@ -352,7 +360,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
             }
             finally
             {
-                foreach (IMoniker moniker in monikers)
+                foreach (INativeMoniker moniker in monikers)
                 {
                     ReleaseComObject(moniker);
                 }
@@ -362,7 +370,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
             }
         }
 
-        private static IEnumerable<int> BuildCandidateOrder(IReadOnlyList<IMoniker> monikers, string? selector)
+        private static IEnumerable<int> BuildCandidateOrder(IReadOnlyList<INativeMoniker> monikers, string? selector)
         {
             if (string.IsNullOrWhiteSpace(selector))
             {
@@ -390,16 +398,31 @@ internal sealed class DirectShowPreviewGraph : IDisposable
             }
         }
 
-        private static string? GetFriendlyName(IMoniker moniker)
+        private static string? GetFriendlyName(INativeMoniker moniker)
         {
             object? bagObject = null;
             try
             {
                 Guid propertyBagId = typeof(IPropertyBag).GUID;
-                moniker.BindToStorage(null!, null!, ref propertyBagId, out bagObject);
+                int hr = moniker.BindToStorage(IntPtr.Zero, IntPtr.Zero, ref propertyBagId, out IntPtr bagPointer);
+                if (hr < 0)
+                {
+                    DiagnosticLog.Write($"BindToStorage failed: 0x{hr:X8}");
+                    return null;
+                }
+
+                try
+                {
+                    bagObject = Marshal.GetObjectForIUnknown(bagPointer);
+                }
+                finally
+                {
+                    Marshal.Release(bagPointer);
+                }
+
                 var propertyBag = (IPropertyBag)bagObject;
-                int hr = propertyBag.Read("FriendlyName", out object value, IntPtr.Zero);
-                return hr >= 0 ? value as string : null;
+                int readHr = propertyBag.Read("FriendlyName", out object value, IntPtr.Zero);
+                return readHr >= 0 ? value as string : null;
             }
             catch
             {
@@ -708,7 +731,52 @@ internal interface ICaptureGraphBuilder2
 internal interface ICreateDevEnum
 {
     [PreserveSig]
-    int CreateClassEnumerator(ref Guid type, out IEnumMoniker? enumMoniker, int flags);
+    int CreateClassEnumerator(ref Guid type, out INativeEnumMoniker? enumMoniker, int flags);
+}
+
+[ComImport]
+[Guid("00000102-0000-0000-C000-000000000046")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface INativeEnumMoniker
+{
+    [PreserveSig]
+    int Next(int count, out INativeMoniker moniker, IntPtr fetched);
+
+    [PreserveSig]
+    int Skip(int count);
+
+    [PreserveSig]
+    int Reset();
+
+    [PreserveSig]
+    int Clone(out INativeEnumMoniker enumMoniker);
+}
+
+[ComImport]
+[Guid("0000000F-0000-0000-C000-000000000046")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface INativeMoniker
+{
+    [PreserveSig]
+    int GetClassID(out Guid classId);
+
+    [PreserveSig]
+    int IsDirty();
+
+    [PreserveSig]
+    int Load(IntPtr stream);
+
+    [PreserveSig]
+    int Save(IntPtr stream, [MarshalAs(UnmanagedType.Bool)] bool clearDirty);
+
+    [PreserveSig]
+    int GetSizeMax(out long size);
+
+    [PreserveSig]
+    int BindToObject(IntPtr bindContext, IntPtr monikerToLeft, ref Guid interfaceId, out IntPtr result);
+
+    [PreserveSig]
+    int BindToStorage(IntPtr bindContext, IntPtr monikerToLeft, ref Guid interfaceId, out IntPtr result);
 }
 
 [ComImport]
