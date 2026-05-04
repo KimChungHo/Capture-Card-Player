@@ -40,11 +40,12 @@ internal sealed class PreviewForm : Form
     private readonly ContextMenuStrip deviceMenu = new();
     private DirectShowPreviewGraph? graph;
     private long lastMenuOpenedTicks;
-    private int volumePercent = 100;
+    private int volumePercent;
 
     public PreviewForm(string? deviceSelector)
     {
         currentDeviceSelector = deviceSelector;
+        volumePercent = UserSettings.LoadVolumePercent();
 
         KeyPreview = true;
         Text = "CaptureCardPlayer";
@@ -135,6 +136,7 @@ internal sealed class PreviewForm : Form
         }
 
         volumePercent = Math.Clamp(volumePercent + (direction * 5), 0, 150);
+        UserSettings.SaveVolumePercent(volumePercent);
         graph?.SetVolumePercent(volumePercent);
         UpdateWindowTitle();
         DiagnosticLog.Write($"Volume changed: {volumePercent}%.");
@@ -997,6 +999,53 @@ internal static class DiagnosticLog
         catch
         {
             // Logging must never stop preview startup or cleanup.
+        }
+    }
+}
+
+internal static class UserSettings
+{
+    private const int DefaultVolumePercent = 100;
+
+    private static string SettingsPath { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "CaptureCardPlayer",
+        "settings.txt");
+
+    public static int LoadVolumePercent()
+    {
+        try
+        {
+            if (!File.Exists(SettingsPath))
+            {
+                return DefaultVolumePercent;
+            }
+
+            string text = File.ReadAllText(SettingsPath).Trim();
+            if (!int.TryParse(text, out int volumePercent))
+            {
+                return DefaultVolumePercent;
+            }
+
+            return Math.Clamp(volumePercent, 0, 150);
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"Failed to load settings: {ex}");
+            return DefaultVolumePercent;
+        }
+    }
+
+    public static void SaveVolumePercent(int volumePercent)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
+            File.WriteAllText(SettingsPath, Math.Clamp(volumePercent, 0, 150).ToString());
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"Failed to save settings: {ex}");
         }
     }
 }
