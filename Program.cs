@@ -34,14 +34,15 @@ internal static class Program
 
 internal sealed class PreviewForm : Form
 {
-    private readonly string? deviceSelector;
-    private readonly Panel previewHost = new();
+    private string? currentDeviceSelector;
+    private readonly PreviewPanel previewHost = new();
     private readonly Label statusLabel = new();
+    private readonly ContextMenuStrip deviceMenu = new();
     private DirectShowPreviewGraph? graph;
 
     public PreviewForm(string? deviceSelector)
     {
-        this.deviceSelector = deviceSelector;
+        currentDeviceSelector = deviceSelector;
 
         Text = "CaptureCardPlayer";
         BackColor = Color.Black;
@@ -64,6 +65,14 @@ internal sealed class PreviewForm : Form
         statusLabel.BringToFront();
 
         previewHost.Resize += (_, _) => graph?.Resize(previewHost.ClientSize);
+        previewHost.MenuRequested += (_, point) => ShowDeviceMenu(point);
+        statusLabel.MouseUp += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Right)
+            {
+                ShowDeviceMenu(statusLabel.PointToScreen(e.Location));
+            }
+        };
     }
 
     protected override void OnShown(EventArgs e)
@@ -84,7 +93,7 @@ internal sealed class PreviewForm : Form
         try
         {
             DiagnosticLog.Write("Starting preview.");
-            graph = DirectShowPreviewGraph.Start(previewHost.Handle, previewHost.ClientSize, deviceSelector);
+            graph = DirectShowPreviewGraph.Start(previewHost.Handle, previewHost.ClientSize, currentDeviceSelector);
             statusLabel.Visible = false;
             Text = $"CaptureCardPlayer - {graph.DeviceName}";
             DiagnosticLog.Write($"Preview started: {graph.DeviceName}");
@@ -97,6 +106,97 @@ internal sealed class PreviewForm : Form
             graph?.Dispose();
             graph = null;
         }
+    }
+
+    private void RestartPreview(string? selector)
+    {
+        currentDeviceSelector = selector;
+        graph?.Dispose();
+        graph = null;
+        StartPreview();
+    }
+
+    private void ShowDeviceMenu(Point screenPoint)
+    {
+        deviceMenu.Items.Clear();
+
+        try
+        {
+            IReadOnlyList<string> devices = DirectShowPreviewGraph.ListVideoCaptureDeviceNames();
+            if (devices.Count == 0)
+            {
+                deviceMenu.Items.Add(new ToolStripMenuItem("No video capture devices") { Enabled = false });
+            }
+
+            for (int i = 0; i < devices.Count; i++)
+            {
+                string deviceName = devices[i];
+                var item = new ToolStripMenuItem(deviceName)
+                {
+                    Checked = string.Equals(graph?.DeviceName, deviceName, StringComparison.OrdinalIgnoreCase),
+                    Tag = deviceName,
+                };
+                item.Click += (_, _) => RestartPreview((string)item.Tag);
+                deviceMenu.Items.Add(item);
+            }
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"Failed to build device menu: {ex}");
+            deviceMenu.Items.Add(new ToolStripMenuItem("Failed to read devices") { Enabled = false });
+        }
+
+        if (deviceMenu.Items.Count > 0)
+        {
+            deviceMenu.Items.Add(new ToolStripSeparator());
+        }
+
+        var refresh = new ToolStripMenuItem("Refresh");
+        refresh.Click += (_, _) => ShowDeviceMenu(screenPoint);
+        deviceMenu.Items.Add(refresh);
+
+        deviceMenu.Show(screenPoint);
+    }
+}
+
+internal sealed class PreviewPanel : Panel
+{
+    private const int WmContextMenu = 0x007B;
+    private const int WmRButtonUp = 0x0205;
+
+    public event EventHandler<Point>? MenuRequested;
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WmContextMenu)
+        {
+            Point point = GetContextMenuPoint(m.LParam);
+            MenuRequested?.Invoke(this, point);
+            return;
+        }
+
+        if (m.Msg == WmRButtonUp)
+        {
+            int x = unchecked((short)(long)m.LParam);
+            int y = unchecked((short)((long)m.LParam >> 16));
+            MenuRequested?.Invoke(this, PointToScreen(new Point(x, y)));
+            return;
+        }
+
+        base.WndProc(ref m);
+    }
+
+    private Point GetContextMenuPoint(IntPtr lParam)
+    {
+        long raw = lParam.ToInt64();
+        if (raw == -1)
+        {
+            return PointToScreen(new Point(Width / 2, Height / 2));
+        }
+
+        int x = unchecked((short)(raw & 0xFFFF));
+        int y = unchecked((short)((raw >> 16) & 0xFFFF));
+        return new Point(x, y);
     }
 }
 
@@ -123,6 +223,12 @@ internal sealed class DirectShowPreviewGraph : IDisposable
     }
 
     public string DeviceName { get; private set; }
+
+    public static IReadOnlyList<string> ListVideoCaptureDeviceNames()
+    {
+        Application.OleRequired();
+        return VideoCaptureDevices.ListNames();
+    }
 
     public static DirectShowPreviewGraph Start(IntPtr owner, Size size, string? deviceSelector)
     {
@@ -285,6 +391,45 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
     private static class VideoCaptureDevices
     {
+        public static IReadOnlyList<string> ListNames()
+        {
+            ICreateDevEnum? createDevEnum = null;
+            INativeEnumMoniker? enumMoniker = null;
+            var monikers = new List<INativeMoniker>();
+            var names = new List<string>();
+
+            try
+            {
+                createDevEnum = CreateComObject<ICreateDevEnum>(DirectShowGuids.CreateDevEnum);
+                Guid category = DirectShowGuids.VideoInputDeviceCategory;
+                int hr = createDevEnum.CreateClassEnumerator(ref category, out enumMoniker, 0);
+                if (hr == HrFalse || enumMoniker is null)
+                {
+                    return names;
+                }
+
+                CheckHr(hr, "Failed to enumerate video capture devices.");
+
+                while (enumMoniker.Next(1, out INativeMoniker current, IntPtr.Zero) == HrSuccess)
+                {
+                    monikers.Add(current);
+                    names.Add(GetFriendlyName(current, releasePropertyBag: true) ?? $"Video Capture Device {names.Count}");
+                }
+
+                return names;
+            }
+            finally
+            {
+                foreach (INativeMoniker moniker in monikers)
+                {
+                    ReleaseComObject(moniker);
+                }
+
+                ReleaseComObject(enumMoniker);
+                ReleaseComObject(createDevEnum);
+            }
+        }
+
         public static IBaseFilter Bind(string? selector, out string deviceName)
         {
             ICreateDevEnum? createDevEnum = null;
@@ -388,17 +533,35 @@ internal sealed class DirectShowPreviewGraph : IDisposable
                 yield break;
             }
 
+            var yielded = new HashSet<int>();
+
             for (int i = 0; i < monikers.Count; i++)
             {
                 string? name = GetFriendlyName(monikers[i]);
+                if (string.Equals(name, selector, StringComparison.OrdinalIgnoreCase))
+                {
+                    yielded.Add(i);
+                    yield return i;
+                }
+            }
+
+            for (int i = 0; i < monikers.Count; i++)
+            {
+                if (yielded.Contains(i))
+                {
+                    continue;
+                }
+
+                string? name = GetFriendlyName(monikers[i]);
                 if (name?.Contains(selector, StringComparison.OrdinalIgnoreCase) == true)
                 {
+                    yielded.Add(i);
                     yield return i;
                 }
             }
         }
 
-        private static string? GetFriendlyName(INativeMoniker moniker)
+        private static string? GetFriendlyName(INativeMoniker moniker, bool releasePropertyBag = false)
         {
             object? bagObject = null;
             try
@@ -430,8 +593,15 @@ internal sealed class DirectShowPreviewGraph : IDisposable
             }
             finally
             {
-                // Some DirectShow monikers expose IPropertyBag on the same COM identity.
-                // FinalReleaseComObject here can disconnect the moniker RCW before BindToObject.
+                if (releasePropertyBag)
+                {
+                    ReleaseComObject(bagObject);
+                }
+                else
+                {
+                    // Some DirectShow monikers expose IPropertyBag on the same COM identity.
+                    // FinalReleaseComObject here can disconnect the moniker RCW before BindToObject.
+                }
             }
         }
     }
