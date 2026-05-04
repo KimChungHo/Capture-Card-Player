@@ -45,8 +45,10 @@ internal sealed class PreviewForm : Form
 
     public PreviewForm(string? deviceSelector)
     {
-        currentDeviceSelector = deviceSelector;
-        volumePercent = UserSettings.LoadVolumePercent();
+        AppSettings settings = UserSettings.Load();
+        volumePercent = settings.VolumePercent;
+        currentDeviceSelector = ResolveStartupDevice(deviceSelector ?? settings.DeviceName);
+        currentFormat = ResolveStartupFormat(currentDeviceSelector, settings.FormatKey);
 
         KeyPreview = true;
         Text = "CaptureCardPlayer";
@@ -99,7 +101,7 @@ internal sealed class PreviewForm : Form
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
-        BeginInvoke(StartPreview);
+        BeginInvoke((MethodInvoker)(() => StartPreview()));
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
@@ -109,7 +111,7 @@ internal sealed class PreviewForm : Form
         base.OnFormClosed(e);
     }
 
-    private void StartPreview()
+    private void StartPreview(bool allowFallback = true)
     {
         try
         {
@@ -121,12 +123,31 @@ internal sealed class PreviewForm : Form
                 currentFormat);
             graph.SetVolumePercent(volumePercent);
             statusLabel.Visible = false;
+            currentDeviceSelector = graph.DeviceName;
+            if (currentFormat is not null && !string.Equals(currentFormat.DisplayName, graph.FormatName, StringComparison.Ordinal))
+            {
+                currentFormat = null;
+            }
+
+            SaveCurrentSettings();
             UpdateWindowTitle();
             DiagnosticLog.Write($"Preview started: {graph.DeviceName}");
         }
         catch (Exception ex)
         {
             DiagnosticLog.Write(ex.ToString());
+            if (allowFallback && (currentDeviceSelector is not null || currentFormat is not null))
+            {
+                DiagnosticLog.Write("Retrying startup with default device and default format.");
+                currentDeviceSelector = null;
+                currentFormat = null;
+                SaveCurrentSettings();
+                graph?.Dispose();
+                graph = null;
+                StartPreview(allowFallback: false);
+                return;
+            }
+
             statusLabel.Text = $"{ex.Message}{Environment.NewLine}{Environment.NewLine}Log: {DiagnosticLog.Path}";
             statusLabel.Visible = true;
             graph?.Dispose();
@@ -143,7 +164,7 @@ internal sealed class PreviewForm : Form
         }
 
         volumePercent = Math.Clamp(volumePercent + (direction * 5), 0, 150);
-        UserSettings.SaveVolumePercent(volumePercent);
+        SaveCurrentSettings();
         graph?.SetVolumePercent(volumePercent);
         UpdateWindowTitle();
         DiagnosticLog.Write($"Volume changed: {volumePercent}%.");
@@ -237,16 +258,81 @@ internal sealed class PreviewForm : Form
     private void UpdateWindowTitle()
     {
         string deviceName = graph?.DeviceName ?? "No Device";
-        Text = $"CaptureCardPlayer - {deviceName} - {volumePercent}%";
+        string formatName = graph?.FormatName ?? (currentFormat?.DisplayName ?? CaptureFormatOption.DeviceDefault.DisplayName);
+        Text = $"CaptureCardPlayer - {deviceName} - {formatName} - {volumePercent}%";
     }
 
     private void RestartPreview(string? selector, CaptureFormatOption? format = null)
     {
         currentDeviceSelector = selector;
         currentFormat = format;
+        SaveCurrentSettings();
         graph?.Dispose();
         graph = null;
         StartPreview();
+    }
+
+    private void SaveCurrentSettings()
+    {
+        UserSettings.Save(new AppSettings(
+            volumePercent,
+            currentDeviceSelector,
+            currentFormat is { IsDeviceDefault: false } ? currentFormat.Key : null));
+    }
+
+    private static string? ResolveStartupDevice(string? preferredDeviceName)
+    {
+        try
+        {
+            IReadOnlyList<string> devices = DirectShowPreviewGraph.ListVideoCaptureDeviceNames();
+            if (devices.Count == 0)
+            {
+                return preferredDeviceName;
+            }
+
+            if (!string.IsNullOrWhiteSpace(preferredDeviceName))
+            {
+                foreach (string deviceName in devices)
+                {
+                    if (string.Equals(deviceName, preferredDeviceName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return deviceName;
+                    }
+                }
+            }
+
+            return devices[0];
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"Failed to resolve startup device: {ex}");
+            return preferredDeviceName;
+        }
+    }
+
+    private static CaptureFormatOption? ResolveStartupFormat(string? deviceName, string? preferredFormatKey)
+    {
+        if (string.IsNullOrWhiteSpace(deviceName) || string.IsNullOrWhiteSpace(preferredFormatKey))
+        {
+            return null;
+        }
+
+        try
+        {
+            foreach (CaptureFormatOption format in DirectShowPreviewGraph.ListVideoCaptureFormats(deviceName))
+            {
+                if (string.Equals(format.Key, preferredFormatKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    return format;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"Failed to resolve startup format: {ex}");
+        }
+
+        return null;
     }
 
     private void ShowDeviceSettings()
@@ -577,6 +663,8 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
     public string DeviceName { get; private set; }
 
+    public string FormatName { get; private set; } = CaptureFormatOption.DeviceDefault.DisplayName;
+
     public Size CaptureSize { get; private set; }
 
     public static IReadOnlyList<string> ListVideoCaptureDeviceNames()
@@ -701,8 +789,11 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
         if (format is not null && !format.IsDeviceDefault)
         {
-            ApplyVideoFormat(format);
-            CaptureSize = format.Size;
+            if (ApplyVideoFormat(format))
+            {
+                CaptureSize = format.Size;
+                FormatName = format.DisplayName;
+            }
         }
 
         DiagnosticLog.Write("Creating VideoRenderer.");
@@ -722,7 +813,9 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
         if (CaptureSize.IsEmpty)
         {
-            CaptureSize = GetCurrentVideoSize();
+            CaptureFormatOption? currentVideoFormat = GetCurrentVideoFormat();
+            CaptureSize = currentVideoFormat?.Size ?? Size.Empty;
+            FormatName = currentVideoFormat?.DisplayName ?? CaptureFormatOption.DeviceDefault.DisplayName;
         }
 
         RenderAudioStream();
@@ -815,7 +908,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         return captureBuilder.RenderStream(ref audioCategory, ref audioType, filter, null, null);
     }
 
-    private void ApplyVideoFormat(CaptureFormatOption format)
+    private bool ApplyVideoFormat(CaptureFormatOption format)
     {
         try
         {
@@ -824,7 +917,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
             if (hr < 0 || count <= 0 || capabilitySize <= 0)
             {
                 DiagnosticLog.Write($"Failed to read video format capability count: 0x{hr:X8}");
-                return;
+                return false;
             }
 
             IntPtr capabilities = Marshal.AllocCoTaskMem(capabilitySize);
@@ -848,7 +941,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
                         CheckHr(streamConfig.Value.SetFormat(mediaTypePointer), $"Failed to set video format {format.DisplayName}.");
                         DiagnosticLog.Write($"Video format applied: {format.DisplayName}");
-                        return;
+                        return true;
                     }
                     finally
                     {
@@ -862,14 +955,16 @@ internal sealed class DirectShowPreviewGraph : IDisposable
             }
 
             DiagnosticLog.Write($"Selected video format was not found: {format.DisplayName}");
+            return false;
         }
         catch (Exception ex)
         {
             DiagnosticLog.Write($"Failed to apply video format: {ex}");
+            return false;
         }
     }
 
-    private Size GetCurrentVideoSize()
+    private CaptureFormatOption? GetCurrentVideoFormat()
     {
         try
         {
@@ -878,13 +973,12 @@ internal sealed class DirectShowPreviewGraph : IDisposable
             if (hr < 0 || mediaTypePointer == IntPtr.Zero)
             {
                 DiagnosticLog.Write($"Failed to read current video format: 0x{hr:X8}");
-                return Size.Empty;
+                return null;
             }
 
             try
             {
-                CaptureFormatOption? current = TryCreateFormatOption(-1, mediaTypePointer);
-                return current?.Size ?? Size.Empty;
+                return TryCreateFormatOption(-1, mediaTypePointer);
             }
             finally
             {
@@ -894,7 +988,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         catch (Exception ex)
         {
             DiagnosticLog.Write($"Failed to read current video size: {ex}");
-            return Size.Empty;
+            return null;
         }
     }
 
@@ -1009,7 +1103,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         double fps = averageTimePerFrame > 0 ? 10000000.0 / averageTimePerFrame : 0;
         string subtype = GetVideoSubtypeName(mediaType.SubType, bitmapHeader.Compression);
         string fpsText = fps > 0 ? fps.ToString("0.###") : "unknown";
-        string key = $"{index}:{subtype}:{width}:{height}:{averageTimePerFrame}:{mediaType.SubType}";
+        string key = $"{subtype}:{width}:{height}:{averageTimePerFrame}:{mediaType.SubType}";
         string displayName = $"{subtype} {width}x{height} {fpsText}";
 
         return new CaptureFormatOption(key, displayName, width, height, fps, subtype);
@@ -1620,6 +1714,11 @@ internal static class DiagnosticLog
     }
 }
 
+internal sealed record AppSettings(
+    int VolumePercent,
+    string? DeviceName,
+    string? FormatKey);
+
 internal static class UserSettings
 {
     private const int DefaultVolumePercent = 100;
@@ -1629,36 +1728,63 @@ internal static class UserSettings
         "CaptureCardPlayer",
         "settings.txt");
 
-    public static int LoadVolumePercent()
+    public static AppSettings Load()
     {
         try
         {
             if (!File.Exists(SettingsPath))
             {
-                return DefaultVolumePercent;
+                return new AppSettings(DefaultVolumePercent, null, null);
             }
 
             string text = File.ReadAllText(SettingsPath).Trim();
-            if (!int.TryParse(text, out int volumePercent))
+            if (int.TryParse(text, out int legacyVolumePercent))
             {
-                return DefaultVolumePercent;
+                return new AppSettings(Math.Clamp(legacyVolumePercent, 0, 150), null, null);
             }
 
-            return Math.Clamp(volumePercent, 0, 150);
+            Dictionary<string, string> values = text
+                .Split([Environment.NewLine], StringSplitOptions.RemoveEmptyEntries)
+                .Select(static line => line.Split('=', 2))
+                .Where(static parts => parts.Length == 2)
+                .ToDictionary(
+                    static parts => parts[0].Trim(),
+                    static parts => parts[1].Trim(),
+                    StringComparer.OrdinalIgnoreCase);
+
+            int volumePercent = DefaultVolumePercent;
+            if (values.TryGetValue("volume", out string? volumeText) && int.TryParse(volumeText, out int parsedVolume))
+            {
+                volumePercent = Math.Clamp(parsedVolume, 0, 150);
+            }
+
+            values.TryGetValue("device", out string? deviceName);
+            values.TryGetValue("formatKey", out string? formatKey);
+
+            return new AppSettings(
+                volumePercent,
+                string.IsNullOrWhiteSpace(deviceName) ? null : deviceName,
+                string.IsNullOrWhiteSpace(formatKey) ? null : formatKey);
         }
         catch (Exception ex)
         {
             DiagnosticLog.Write($"Failed to load settings: {ex}");
-            return DefaultVolumePercent;
+            return new AppSettings(DefaultVolumePercent, null, null);
         }
     }
 
-    public static void SaveVolumePercent(int volumePercent)
+    public static void Save(AppSettings settings)
     {
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
-            File.WriteAllText(SettingsPath, Math.Clamp(volumePercent, 0, 150).ToString());
+            string[] lines =
+            [
+                $"volume={Math.Clamp(settings.VolumePercent, 0, 150)}",
+                $"device={settings.DeviceName ?? string.Empty}",
+                $"formatKey={settings.FormatKey ?? string.Empty}",
+            ];
+            File.WriteAllLines(SettingsPath, lines);
         }
         catch (Exception ex)
         {
