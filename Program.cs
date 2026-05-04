@@ -430,7 +430,8 @@ internal sealed class DirectShowPreviewGraph : IDisposable
             }
             finally
             {
-                ReleaseComObject(bagObject);
+                // Some DirectShow monikers expose IPropertyBag on the same COM identity.
+                // FinalReleaseComObject here can disconnect the moniker RCW before BindToObject.
             }
         }
     }
