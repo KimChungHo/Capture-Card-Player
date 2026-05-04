@@ -35,6 +35,7 @@ internal static class Program
 internal sealed class PreviewForm : Form
 {
     private string? currentDeviceSelector;
+    private CaptureFormatOption? currentFormat;
     private readonly PreviewPanel previewHost = new();
     private readonly Label statusLabel = new();
     private readonly ContextMenuStrip deviceMenu = new();
@@ -70,6 +71,7 @@ internal sealed class PreviewForm : Form
 
         previewHost.Resize += (_, _) => graph?.Resize(previewHost.ClientSize);
         previewHost.MenuRequested += (_, point) => ShowDeviceMenu(point);
+        previewHost.SettingsRequested += (_, _) => ShowDeviceSettings();
         previewHost.WheelRequested += (_, delta) => ChangeVolume(delta);
         previewHost.ShortcutRequested += (_, shortcut) => HandleShortcut(shortcut);
         MouseWheel += (_, e) => ChangeVolume(e.Delta);
@@ -81,6 +83,7 @@ internal sealed class PreviewForm : Form
             }
         };
         statusLabel.MouseWheel += (_, e) => ChangeVolume(e.Delta);
+        statusLabel.DoubleClick += (_, _) => ShowDeviceSettings();
     }
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
@@ -111,7 +114,11 @@ internal sealed class PreviewForm : Form
         try
         {
             DiagnosticLog.Write("Starting preview.");
-            graph = DirectShowPreviewGraph.Start(previewHost.Handle, previewHost.ClientSize, currentDeviceSelector);
+            graph = DirectShowPreviewGraph.Start(
+                previewHost.Handle,
+                previewHost.ClientSize,
+                currentDeviceSelector,
+                currentFormat);
             graph.SetVolumePercent(volumePercent);
             statusLabel.Visible = false;
             UpdateWindowTitle();
@@ -208,7 +215,23 @@ internal sealed class PreviewForm : Form
         var bitmap = new Bitmap(bounds.Width, bounds.Height);
         using Graphics graphics = Graphics.FromImage(bitmap);
         graphics.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size, CopyPixelOperation.SourceCopy);
-        return bitmap;
+
+        Size targetSize = graph?.CaptureSize ?? Size.Empty;
+        if (targetSize.Width <= 0 || targetSize.Height <= 0 || targetSize == bitmap.Size)
+        {
+            return bitmap;
+        }
+
+        var resized = new Bitmap(targetSize.Width, targetSize.Height);
+        using (Graphics resizedGraphics = Graphics.FromImage(resized))
+        {
+            resizedGraphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+            resizedGraphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+            resizedGraphics.DrawImage(bitmap, new Rectangle(Point.Empty, targetSize));
+        }
+
+        bitmap.Dispose();
+        return resized;
     }
 
     private void UpdateWindowTitle()
@@ -217,12 +240,29 @@ internal sealed class PreviewForm : Form
         Text = $"CaptureCardPlayer - {deviceName} - {volumePercent}%";
     }
 
-    private void RestartPreview(string? selector)
+    private void RestartPreview(string? selector, CaptureFormatOption? format = null)
     {
         currentDeviceSelector = selector;
+        currentFormat = format;
         graph?.Dispose();
         graph = null;
         StartPreview();
+    }
+
+    private void ShowDeviceSettings()
+    {
+        try
+        {
+            using var dialog = new DeviceSettingsDialog(currentDeviceSelector ?? graph?.DeviceName, currentFormat);
+            if (dialog.ShowDialog(this) == DialogResult.OK)
+            {
+                RestartPreview(dialog.SelectedDeviceName, dialog.SelectedFormat);
+            }
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"Failed to show device settings: {ex}");
+        }
     }
 
     private void ShowDeviceMenu(Point screenPoint)
@@ -279,9 +319,11 @@ internal sealed class PreviewPanel : Panel
 {
     private const int WmContextMenu = 0x007B;
     private const int WmKeyDown = 0x0100;
+    private const int WmLButtonDblClk = 0x0203;
     private const int WmMouseWheel = 0x020A;
 
     public event EventHandler<Point>? MenuRequested;
+    public event EventHandler? SettingsRequested;
     public event EventHandler<int>? WheelRequested;
     public event EventHandler<Keys>? ShortcutRequested;
 
@@ -291,6 +333,12 @@ internal sealed class PreviewPanel : Panel
         {
             Point point = GetContextMenuPoint(m.LParam);
             MenuRequested?.Invoke(this, point);
+            return;
+        }
+
+        if (m.Msg == WmLButtonDblClk)
+        {
+            SettingsRequested?.Invoke(this, EventArgs.Empty);
             return;
         }
 
@@ -328,6 +376,181 @@ internal sealed class PreviewPanel : Panel
     }
 }
 
+internal sealed class DeviceSettingsDialog : Form
+{
+    private readonly ComboBox deviceCombo = new();
+    private readonly ComboBox formatCombo = new();
+    private readonly Button okButton = new();
+    private readonly Button cancelButton = new();
+    private bool loading;
+
+    public DeviceSettingsDialog(string? currentDeviceName, CaptureFormatOption? currentFormat)
+    {
+        Text = "Device Settings";
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        StartPosition = FormStartPosition.CenterParent;
+        MinimizeBox = false;
+        MaximizeBox = false;
+        ShowInTaskbar = false;
+        ClientSize = new Size(620, 180);
+
+        var deviceLabel = new Label
+        {
+            AutoSize = true,
+            Location = new Point(20, 25),
+            Text = "Device",
+        };
+
+        deviceCombo.DropDownStyle = ComboBoxStyle.DropDownList;
+        deviceCombo.Location = new Point(95, 20);
+        deviceCombo.Size = new Size(485, 28);
+        deviceCombo.SelectedIndexChanged += (_, _) =>
+        {
+            if (!loading)
+            {
+                LoadFormats(null);
+            }
+        };
+
+        var formatLabel = new Label
+        {
+            AutoSize = true,
+            Location = new Point(20, 70),
+            Text = "Format",
+        };
+
+        formatCombo.DropDownStyle = ComboBoxStyle.DropDownList;
+        formatCombo.Location = new Point(95, 65);
+        formatCombo.Size = new Size(485, 28);
+
+        okButton.Text = "OK";
+        okButton.DialogResult = DialogResult.OK;
+        okButton.Location = new Point(410, 125);
+        okButton.Size = new Size(80, 28);
+
+        cancelButton.Text = "Cancel";
+        cancelButton.DialogResult = DialogResult.Cancel;
+        cancelButton.Location = new Point(500, 125);
+        cancelButton.Size = new Size(80, 28);
+
+        AcceptButton = okButton;
+        CancelButton = cancelButton;
+
+        Controls.Add(deviceLabel);
+        Controls.Add(deviceCombo);
+        Controls.Add(formatLabel);
+        Controls.Add(formatCombo);
+        Controls.Add(okButton);
+        Controls.Add(cancelButton);
+
+        LoadDevices(currentDeviceName, currentFormat);
+    }
+
+    public string? SelectedDeviceName => deviceCombo.SelectedItem as string;
+
+    public CaptureFormatOption? SelectedFormat => formatCombo.SelectedItem as CaptureFormatOption;
+
+    private void LoadDevices(string? currentDeviceName, CaptureFormatOption? currentFormat)
+    {
+        loading = true;
+        try
+        {
+            deviceCombo.Items.Clear();
+            foreach (string deviceName in DirectShowPreviewGraph.ListVideoCaptureDeviceNames())
+            {
+                deviceCombo.Items.Add(deviceName);
+            }
+
+            if (deviceCombo.Items.Count == 0)
+            {
+                okButton.Enabled = false;
+                return;
+            }
+
+            int selectedIndex = 0;
+            if (!string.IsNullOrWhiteSpace(currentDeviceName))
+            {
+                for (int i = 0; i < deviceCombo.Items.Count; i++)
+                {
+                    if (string.Equals(deviceCombo.Items[i] as string, currentDeviceName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        selectedIndex = i;
+                        break;
+                    }
+                }
+            }
+
+            deviceCombo.SelectedIndex = selectedIndex;
+        }
+        finally
+        {
+            loading = false;
+        }
+
+        LoadFormats(currentFormat);
+    }
+
+    private void LoadFormats(CaptureFormatOption? currentFormat)
+    {
+        formatCombo.Items.Clear();
+        formatCombo.Items.Add(CaptureFormatOption.DeviceDefault);
+
+        string? selectedDevice = SelectedDeviceName;
+        if (!string.IsNullOrWhiteSpace(selectedDevice))
+        {
+            try
+            {
+                foreach (CaptureFormatOption format in DirectShowPreviewGraph.ListVideoCaptureFormats(selectedDevice))
+                {
+                    formatCombo.Items.Add(format);
+                }
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLog.Write($"Failed to load video formats: {ex}");
+            }
+        }
+
+        int selectedIndex = 0;
+        if (currentFormat is not null && !currentFormat.IsDeviceDefault)
+        {
+            for (int i = 1; i < formatCombo.Items.Count; i++)
+            {
+                if (formatCombo.Items[i] is CaptureFormatOption item && item.Key == currentFormat.Key)
+                {
+                    selectedIndex = i;
+                    break;
+                }
+            }
+        }
+
+        formatCombo.SelectedIndex = selectedIndex;
+    }
+}
+
+internal sealed record CaptureFormatOption(
+    string Key,
+    string DisplayName,
+    int Width,
+    int Height,
+    double FramesPerSecond,
+    string Subtype)
+{
+    public static CaptureFormatOption DeviceDefault { get; } = new(
+        "default",
+        "Device default",
+        0,
+        0,
+        0,
+        string.Empty);
+
+    public bool IsDeviceDefault => Key == DeviceDefault.Key;
+
+    public Size Size => Width > 0 && Height > 0 ? new Size(Width, Height) : Size.Empty;
+
+    public override string ToString() => DisplayName;
+}
+
 internal sealed class DirectShowPreviewGraph : IDisposable
 {
     private const int OaTrue = -1;
@@ -354,20 +577,57 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
     public string DeviceName { get; private set; }
 
+    public Size CaptureSize { get; private set; }
+
     public static IReadOnlyList<string> ListVideoCaptureDeviceNames()
     {
         Application.OleRequired();
         return VideoCaptureDevices.ListNames();
     }
 
-    public static DirectShowPreviewGraph Start(IntPtr owner, Size size, string? deviceSelector)
+    public static IReadOnlyList<CaptureFormatOption> ListVideoCaptureFormats(string deviceSelector)
+    {
+        Application.OleRequired();
+
+        IGraphBuilder? temporaryGraph = null;
+        ICaptureGraphBuilder2? temporaryCaptureBuilder = null;
+        IBaseFilter? temporarySourceFilter = null;
+
+        try
+        {
+            temporaryGraph = CreateComObject<IGraphBuilder>(DirectShowGuids.FilterGraph);
+            temporaryCaptureBuilder = CreateComObject<ICaptureGraphBuilder2>(DirectShowGuids.CaptureGraphBuilder2);
+            CheckHr(temporaryCaptureBuilder.SetFiltergraph(temporaryGraph), "Failed to initialize format enumeration graph.");
+
+            temporarySourceFilter = VideoCaptureDevices.Bind(deviceSelector, out string deviceName);
+            var filterGraph = (IFilterGraph)temporaryGraph;
+            CheckHr(filterGraph.AddFilter(temporarySourceFilter, deviceName), "Failed to add device for format enumeration.");
+
+            using ComReleaser<IAMStreamConfig> streamConfig = FindVideoStreamConfig(
+                temporaryCaptureBuilder,
+                temporarySourceFilter);
+            return EnumerateVideoFormats(streamConfig.Value);
+        }
+        finally
+        {
+            ReleaseComObject(temporarySourceFilter);
+            ReleaseComObject(temporaryCaptureBuilder);
+            ReleaseComObject(temporaryGraph);
+        }
+    }
+
+    public static DirectShowPreviewGraph Start(
+        IntPtr owner,
+        Size size,
+        string? deviceSelector,
+        CaptureFormatOption? format)
     {
         Application.OleRequired();
 
         var preview = new DirectShowPreviewGraph(deviceSelector ?? "Video Capture Device");
         try
         {
-            preview.Build(owner, size, deviceSelector);
+            preview.Build(owner, size, deviceSelector, format);
             return preview;
         }
         catch
@@ -422,7 +682,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         }
     }
 
-    private void Build(IntPtr owner, Size size, string? deviceSelector)
+    private void Build(IntPtr owner, Size size, string? deviceSelector, CaptureFormatOption? format)
     {
         DiagnosticLog.Write("Creating FilterGraph.");
         graphBuilder = CreateComObject<IGraphBuilder>(DirectShowGuids.FilterGraph);
@@ -439,6 +699,12 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         var filterGraph = (IFilterGraph)graphBuilder;
         CheckHr(filterGraph.AddFilter(sourceFilter, deviceName), "Failed to add the capture device to the graph.");
 
+        if (format is not null && !format.IsDeviceDefault)
+        {
+            ApplyVideoFormat(format);
+            CaptureSize = format.Size;
+        }
+
         DiagnosticLog.Write("Creating VideoRenderer.");
         rendererFilter = CreateComObject<IBaseFilter>(DirectShowGuids.VideoRenderer);
         CheckHr(filterGraph.AddFilter(rendererFilter, "Video Renderer"), "Failed to add the video renderer.");
@@ -453,6 +719,11 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         }
 
         CheckHr(hr, "Failed to render the video capture stream.");
+
+        if (CaptureSize.IsEmpty)
+        {
+            CaptureSize = GetCurrentVideoSize();
+        }
 
         RenderAudioStream();
 
@@ -542,6 +813,249 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         audioCategory = DirectShowGuids.PinCategoryPreview;
         audioType = DirectShowGuids.MediaTypeAudio;
         return captureBuilder.RenderStream(ref audioCategory, ref audioType, filter, null, null);
+    }
+
+    private void ApplyVideoFormat(CaptureFormatOption format)
+    {
+        try
+        {
+            using ComReleaser<IAMStreamConfig> streamConfig = FindVideoStreamConfig(captureBuilder!, sourceFilter!);
+            int hr = streamConfig.Value.GetNumberOfCapabilities(out int count, out int capabilitySize);
+            if (hr < 0 || count <= 0 || capabilitySize <= 0)
+            {
+                DiagnosticLog.Write($"Failed to read video format capability count: 0x{hr:X8}");
+                return;
+            }
+
+            IntPtr capabilities = Marshal.AllocCoTaskMem(capabilitySize);
+            try
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    hr = streamConfig.Value.GetStreamCaps(i, out IntPtr mediaTypePointer, capabilities);
+                    if (hr < 0 || mediaTypePointer == IntPtr.Zero)
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        CaptureFormatOption? candidate = TryCreateFormatOption(i, mediaTypePointer);
+                        if (candidate?.Key != format.Key)
+                        {
+                            continue;
+                        }
+
+                        CheckHr(streamConfig.Value.SetFormat(mediaTypePointer), $"Failed to set video format {format.DisplayName}.");
+                        DiagnosticLog.Write($"Video format applied: {format.DisplayName}");
+                        return;
+                    }
+                    finally
+                    {
+                        ReleaseMediaType(mediaTypePointer);
+                    }
+                }
+            }
+            finally
+            {
+                Marshal.FreeCoTaskMem(capabilities);
+            }
+
+            DiagnosticLog.Write($"Selected video format was not found: {format.DisplayName}");
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"Failed to apply video format: {ex}");
+        }
+    }
+
+    private Size GetCurrentVideoSize()
+    {
+        try
+        {
+            using ComReleaser<IAMStreamConfig> streamConfig = FindVideoStreamConfig(captureBuilder!, sourceFilter!);
+            int hr = streamConfig.Value.GetFormat(out IntPtr mediaTypePointer);
+            if (hr < 0 || mediaTypePointer == IntPtr.Zero)
+            {
+                DiagnosticLog.Write($"Failed to read current video format: 0x{hr:X8}");
+                return Size.Empty;
+            }
+
+            try
+            {
+                CaptureFormatOption? current = TryCreateFormatOption(-1, mediaTypePointer);
+                return current?.Size ?? Size.Empty;
+            }
+            finally
+            {
+                ReleaseMediaType(mediaTypePointer);
+            }
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"Failed to read current video size: {ex}");
+            return Size.Empty;
+        }
+    }
+
+    private static ComReleaser<IAMStreamConfig> FindVideoStreamConfig(
+        ICaptureGraphBuilder2 builder,
+        IBaseFilter source)
+    {
+        Guid category = DirectShowGuids.PinCategoryCapture;
+        Guid mediaType = DirectShowGuids.MediaTypeVideo;
+        Guid interfaceId = typeof(IAMStreamConfig).GUID;
+        int hr = builder.FindInterface(ref category, ref mediaType, source, ref interfaceId, out IntPtr streamConfigPointer);
+
+        if (hr < 0 || streamConfigPointer == IntPtr.Zero)
+        {
+            category = DirectShowGuids.PinCategoryPreview;
+            mediaType = DirectShowGuids.MediaTypeVideo;
+            hr = builder.FindInterface(ref category, ref mediaType, source, ref interfaceId, out streamConfigPointer);
+        }
+
+        CheckHr(hr, "Failed to find video stream configuration.");
+
+        try
+        {
+            return new ComReleaser<IAMStreamConfig>((IAMStreamConfig)Marshal.GetObjectForIUnknown(streamConfigPointer));
+        }
+        finally
+        {
+            Marshal.Release(streamConfigPointer);
+        }
+    }
+
+    private static IReadOnlyList<CaptureFormatOption> EnumerateVideoFormats(IAMStreamConfig streamConfig)
+    {
+        int hr = streamConfig.GetNumberOfCapabilities(out int count, out int capabilitySize);
+        CheckHr(hr, "Failed to get video format capability count.");
+
+        var formats = new List<CaptureFormatOption>();
+        var seen = new HashSet<string>();
+        IntPtr capabilities = Marshal.AllocCoTaskMem(capabilitySize);
+
+        try
+        {
+            for (int i = 0; i < count; i++)
+            {
+                hr = streamConfig.GetStreamCaps(i, out IntPtr mediaTypePointer, capabilities);
+                if (hr < 0 || mediaTypePointer == IntPtr.Zero)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    CaptureFormatOption? format = TryCreateFormatOption(i, mediaTypePointer);
+                    if (format is not null && seen.Add(format.Key))
+                    {
+                        formats.Add(format);
+                    }
+                }
+                finally
+                {
+                    ReleaseMediaType(mediaTypePointer);
+                }
+            }
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(capabilities);
+        }
+
+        return formats
+            .OrderBy(format => format.Width)
+            .ThenBy(format => format.Height)
+            .ThenBy(format => format.Subtype)
+            .ThenBy(format => format.FramesPerSecond)
+            .ToArray();
+    }
+
+    private static CaptureFormatOption? TryCreateFormatOption(int index, IntPtr mediaTypePointer)
+    {
+        AMMediaType mediaType = Marshal.PtrToStructure<AMMediaType>(mediaTypePointer);
+        if (mediaType.FormatPointer == IntPtr.Zero)
+        {
+            return null;
+        }
+
+        BitmapInfoHeader bitmapHeader;
+        long averageTimePerFrame;
+        if (mediaType.FormatType == DirectShowGuids.FormatVideoInfo)
+        {
+            VideoInfoHeader videoInfo = Marshal.PtrToStructure<VideoInfoHeader>(mediaType.FormatPointer);
+            bitmapHeader = videoInfo.BitmapInfoHeader;
+            averageTimePerFrame = videoInfo.AverageTimePerFrame;
+        }
+        else if (mediaType.FormatType == DirectShowGuids.FormatVideoInfo2)
+        {
+            VideoInfoHeader2 videoInfo = Marshal.PtrToStructure<VideoInfoHeader2>(mediaType.FormatPointer);
+            bitmapHeader = videoInfo.BitmapInfoHeader;
+            averageTimePerFrame = videoInfo.AverageTimePerFrame;
+        }
+        else
+        {
+            return null;
+        }
+
+        int width = Math.Abs(bitmapHeader.Width);
+        int height = Math.Abs(bitmapHeader.Height);
+        if (width <= 0 || height <= 0)
+        {
+            return null;
+        }
+
+        double fps = averageTimePerFrame > 0 ? 10000000.0 / averageTimePerFrame : 0;
+        string subtype = GetVideoSubtypeName(mediaType.SubType, bitmapHeader.Compression);
+        string fpsText = fps > 0 ? fps.ToString("0.###") : "unknown";
+        string key = $"{index}:{subtype}:{width}:{height}:{averageTimePerFrame}:{mediaType.SubType}";
+        string displayName = $"{subtype} {width}x{height} {fpsText}";
+
+        return new CaptureFormatOption(key, displayName, width, height, fps, subtype);
+    }
+
+    private static string GetVideoSubtypeName(Guid subtype, int compression)
+    {
+        if (DirectShowGuids.VideoSubtypeNames.TryGetValue(subtype, out string? name))
+        {
+            return name;
+        }
+
+        string fourCc = FourCcToString(compression);
+        return !string.IsNullOrWhiteSpace(fourCc) ? fourCc : subtype.ToString();
+    }
+
+    private static string FourCcToString(int compression)
+    {
+        char c1 = (char)(compression & 0xFF);
+        char c2 = (char)((compression >> 8) & 0xFF);
+        char c3 = (char)((compression >> 16) & 0xFF);
+        char c4 = (char)((compression >> 24) & 0xFF);
+
+        char[] chars = [c1, c2, c3, c4];
+        return chars.All(static c => c >= 32 && c <= 126) ? new string(chars) : string.Empty;
+    }
+
+    private static void ReleaseMediaType(IntPtr mediaTypePointer)
+    {
+        if (mediaTypePointer == IntPtr.Zero)
+        {
+            return;
+        }
+
+        AMMediaType mediaType = Marshal.PtrToStructure<AMMediaType>(mediaTypePointer);
+        if (mediaType.FormatSize != 0 && mediaType.FormatPointer != IntPtr.Zero)
+        {
+            Marshal.FreeCoTaskMem(mediaType.FormatPointer);
+        }
+
+        if (mediaType.UnknownPointer != IntPtr.Zero)
+        {
+            Marshal.Release(mediaType.UnknownPointer);
+        }
+
+        Marshal.FreeCoTaskMem(mediaTypePointer);
     }
 
     private static int ConvertToDirectShowVolume(int percent)
@@ -976,10 +1490,113 @@ internal static class DirectShowGuids
     public static readonly Guid PinCategoryCapture = new("FB6C4281-0353-11D1-905F-0000C0CC16BA");
     public static readonly Guid MediaTypeVideo = new("73646976-0000-0010-8000-00AA00389B71");
     public static readonly Guid MediaTypeAudio = new("73647561-0000-0010-8000-00AA00389B71");
+    public static readonly Guid FormatVideoInfo = new("05589F80-C356-11CE-BF01-00AA0055595A");
+    public static readonly Guid FormatVideoInfo2 = new("F72A76A0-EB0A-11D0-ACE4-0000C0CC16BA");
     public static readonly Guid FilterGraph = new("E436EBB3-524F-11CE-9F53-0020AF0BA770");
     public static readonly Guid CaptureGraphBuilder2 = new("BF87B6E1-8C27-11D0-B3F0-00AA003761C5");
     public static readonly Guid CreateDevEnum = new("62BE5D10-60EB-11D0-BD3B-00A0C911CE86");
     public static readonly Guid VideoRenderer = new("70E102B0-5556-11CE-97C0-00AA0055595A");
+
+    public static IReadOnlyDictionary<Guid, string> VideoSubtypeNames { get; } = new Dictionary<Guid, string>
+    {
+        [new("30313050-0000-0010-8000-00AA00389B71")] = "P010",
+        [new("3231564E-0000-0010-8000-00AA00389B71")] = "NV12",
+        [new("32595559-0000-0010-8000-00AA00389B71")] = "YUY2",
+        [new("34363248-0000-0010-8000-00AA00389B71")] = "H264",
+        [new("47504A4D-0000-0010-8000-00AA00389B71")] = "MJPG",
+        [new("56555949-0000-0010-8000-00AA00389B71")] = "IYUV",
+        [new("59565955-0000-0010-8000-00AA00389B71")] = "UYVY",
+        [new("E436EB7D-524F-11CE-9F53-0020AF0BA770")] = "RGB24",
+        [new("E436EB7E-524F-11CE-9F53-0020AF0BA770")] = "RGB32",
+    };
+}
+
+internal sealed class ComReleaser<T> : IDisposable
+    where T : class
+{
+    public ComReleaser(T value)
+    {
+        Value = value;
+    }
+
+    public T Value { get; }
+
+    public void Dispose()
+    {
+        if (Marshal.IsComObject(Value))
+        {
+            Marshal.FinalReleaseComObject(Value);
+        }
+    }
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct AMMediaType
+{
+    public Guid MajorType;
+    public Guid SubType;
+    [MarshalAs(UnmanagedType.Bool)]
+    public bool FixedSizeSamples;
+    [MarshalAs(UnmanagedType.Bool)]
+    public bool TemporalCompression;
+    public int SampleSize;
+    public Guid FormatType;
+    public IntPtr UnknownPointer;
+    public int FormatSize;
+    public IntPtr FormatPointer;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct NativeRect
+{
+    public int Left;
+    public int Top;
+    public int Right;
+    public int Bottom;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct BitmapInfoHeader
+{
+    public int Size;
+    public int Width;
+    public int Height;
+    public short Planes;
+    public short BitCount;
+    public int Compression;
+    public int SizeImage;
+    public int XPelsPerMeter;
+    public int YPelsPerMeter;
+    public int ClrUsed;
+    public int ClrImportant;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VideoInfoHeader
+{
+    public NativeRect Source;
+    public NativeRect Target;
+    public int BitRate;
+    public int BitErrorRate;
+    public long AverageTimePerFrame;
+    public BitmapInfoHeader BitmapInfoHeader;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VideoInfoHeader2
+{
+    public NativeRect Source;
+    public NativeRect Target;
+    public int BitRate;
+    public int BitErrorRate;
+    public long AverageTimePerFrame;
+    public int InterlaceFlags;
+    public int CopyProtectFlags;
+    public int PictAspectRatioX;
+    public int PictAspectRatioY;
+    public int ControlFlags;
+    public int Reserved2;
+    public BitmapInfoHeader BitmapInfoHeader;
 }
 
 internal static class DiagnosticLog
@@ -1089,6 +1706,24 @@ internal interface IFilterGraph
 [Guid("56A86895-0AD4-11CE-B03A-0020AF0BA770")]
 [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 internal interface IBaseFilter;
+
+[ComImport]
+[Guid("C6E13340-30AC-11D0-A18C-00A0C9118956")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IAMStreamConfig
+{
+    [PreserveSig]
+    int SetFormat(IntPtr mediaType);
+
+    [PreserveSig]
+    int GetFormat(out IntPtr mediaType);
+
+    [PreserveSig]
+    int GetNumberOfCapabilities(out int count, out int size);
+
+    [PreserveSig]
+    int GetStreamCaps(int index, out IntPtr mediaType, IntPtr streamConfigCaps);
+}
 
 [ComImport]
 [Guid("56A868B1-0AD4-11CE-B03A-0020AF0BA770")]
