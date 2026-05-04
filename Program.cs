@@ -124,9 +124,13 @@ internal sealed class PreviewForm : Form
             graph.SetVolumePercent(volumePercent);
             statusLabel.Visible = false;
             currentDeviceSelector = graph.DeviceName;
-            if (currentFormat is not null && !string.Equals(currentFormat.DisplayName, graph.FormatName, StringComparison.Ordinal))
+            if (graph.AppliedFormat is not null)
             {
-                currentFormat = null;
+                currentFormat = graph.AppliedFormat;
+            }
+            else if (currentFormat is { IsDeviceDefault: false })
+            {
+                currentFormat = CaptureFormatOption.DeviceDefault;
             }
 
             SaveCurrentSettings();
@@ -665,6 +669,8 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
     public string FormatName { get; private set; } = CaptureFormatOption.DeviceDefault.DisplayName;
 
+    public CaptureFormatOption? AppliedFormat { get; private set; }
+
     public Size CaptureSize { get; private set; }
 
     public static IReadOnlyList<string> ListVideoCaptureDeviceNames()
@@ -791,6 +797,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         {
             if (ApplyVideoFormat(format))
             {
+                AppliedFormat = format;
                 CaptureSize = format.Size;
                 FormatName = format.DisplayName;
             }
