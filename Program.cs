@@ -34,13 +34,20 @@ internal static class Program
 
 internal sealed class PreviewForm : Form
 {
+    private const int CursorHideDelayMilliseconds = 3000;
+    private const int CursorPollIntervalMilliseconds = 250;
+
     private string? currentDeviceSelector;
     private CaptureFormatOption? currentFormat;
     private readonly PreviewPanel previewHost = new();
     private readonly Label statusLabel = new();
     private readonly ContextMenuStrip deviceMenu = new();
+    private readonly System.Windows.Forms.Timer cursorIdleTimer = new();
     private DirectShowPreviewGraph? graph;
     private long lastMenuOpenedTicks;
+    private Point lastCursorPosition;
+    private long lastCursorMovedTicks;
+    private bool cursorHidden;
     private int volumePercent;
 
     public PreviewForm(string? deviceSelector)
@@ -49,6 +56,8 @@ internal sealed class PreviewForm : Form
         volumePercent = settings.VolumePercent;
         currentDeviceSelector = ResolveStartupDevice(deviceSelector ?? settings.DeviceName);
         currentFormat = ResolveStartupFormat(currentDeviceSelector, settings.FormatKey);
+        lastCursorPosition = Cursor.Position;
+        lastCursorMovedTicks = Environment.TickCount64;
 
         KeyPreview = true;
         Text = "CaptureCardPlayer";
@@ -86,6 +95,10 @@ internal sealed class PreviewForm : Form
         };
         statusLabel.MouseWheel += (_, e) => ChangeVolume(e.Delta);
         statusLabel.DoubleClick += (_, _) => ShowDeviceSettings();
+
+        cursorIdleTimer.Interval = CursorPollIntervalMilliseconds;
+        cursorIdleTimer.Tick += (_, _) => UpdateCursorVisibility();
+        cursorIdleTimer.Start();
     }
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
@@ -106,9 +119,19 @@ internal sealed class PreviewForm : Form
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
+        cursorIdleTimer.Stop();
+        cursorIdleTimer.Dispose();
+        ShowCursorIfHidden();
         graph?.Dispose();
         graph = null;
         base.OnFormClosed(e);
+    }
+
+    protected override void OnDeactivate(EventArgs e)
+    {
+        ShowCursorIfHidden();
+        ResetCursorIdleTimer();
+        base.OnDeactivate(e);
     }
 
     private void StartPreview(bool allowFallback = true)
@@ -343,6 +366,8 @@ internal sealed class PreviewForm : Form
     {
         try
         {
+            ShowCursorIfHidden();
+            ResetCursorIdleTimer();
             using var dialog = new DeviceSettingsDialog(currentDeviceSelector ?? graph?.DeviceName, currentFormat);
             if (dialog.ShowDialog(this) == DialogResult.OK)
             {
@@ -357,6 +382,8 @@ internal sealed class PreviewForm : Form
 
     private void ShowDeviceMenu(Point screenPoint)
     {
+        ShowCursorIfHidden();
+        ResetCursorIdleTimer();
         deviceMenu.Items.Clear();
 
         try
@@ -402,6 +429,59 @@ internal sealed class PreviewForm : Form
 
         lastMenuOpenedTicks = nowTicks;
         deviceMenu.Show(previewHost, previewHost.PointToClient(screenPoint));
+    }
+
+    private void UpdateCursorVisibility()
+    {
+        long nowTicks = Environment.TickCount64;
+        Point currentPosition = Cursor.Position;
+
+        if (currentPosition != lastCursorPosition)
+        {
+            lastCursorPosition = currentPosition;
+            lastCursorMovedTicks = nowTicks;
+            ShowCursorIfHidden();
+        }
+
+        if (!Bounds.Contains(currentPosition) || Form.ActiveForm != this || deviceMenu.Visible)
+        {
+            ShowCursorIfHidden();
+            lastCursorMovedTicks = nowTicks;
+            return;
+        }
+
+        if (nowTicks - lastCursorMovedTicks >= CursorHideDelayMilliseconds)
+        {
+            HideCursorIfVisible();
+        }
+    }
+
+    private void ResetCursorIdleTimer()
+    {
+        lastCursorPosition = Cursor.Position;
+        lastCursorMovedTicks = Environment.TickCount64;
+    }
+
+    private void HideCursorIfVisible()
+    {
+        if (cursorHidden)
+        {
+            return;
+        }
+
+        Cursor.Hide();
+        cursorHidden = true;
+    }
+
+    private void ShowCursorIfHidden()
+    {
+        if (!cursorHidden)
+        {
+            return;
+        }
+
+        Cursor.Show();
+        cursorHidden = false;
     }
 }
 
