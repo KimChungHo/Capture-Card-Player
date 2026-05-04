@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v1.0.0"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark this release as a prerelease"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build and publish release
+    runs-on: windows-latest
+
+    env:
+      PROJECT_PATH: CaptureCardPlayer.csproj
+      PUBLISH_DIR: publish/win-x64
+      RELEASE_EXE: CaptureCardPlayer.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Resolve release tag
+        id: release_tag
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            "tag=${{ inputs.tag }}" >> $env:GITHUB_OUTPUT
+          } else {
+            "tag=${{ github.ref_name }}" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Restore
+        shell: pwsh
+        run: dotnet restore $env:PROJECT_PATH
+
+      - name: Publish single-file exe
+        shell: pwsh
+        run: dotnet publish $env:PROJECT_PATH -c Release -r win-x64 --self-contained true -o $env:PUBLISH_DIR
+
+      - name: Rename release asset
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.release_tag.outputs.tag }}"
+          $assetName = "CaptureCardPlayer-$tag-win-x64.exe"
+          Move-Item -LiteralPath "$env:PUBLISH_DIR\$env:RELEASE_EXE" -Destination "$env:PUBLISH_DIR\$assetName"
+          "ASSET_PATH=$env:PUBLISH_DIR\$assetName" >> $env:GITHUB_ENV
+          "ASSET_NAME=$assetName" >> $env:GITHUB_ENV
+
+      - name: Generate checksum
+        shell: pwsh
+        run: |
+          $hash = Get-FileHash -Algorithm SHA256 -LiteralPath "$env:ASSET_PATH"
+          "$($hash.Hash)  $env:ASSET_NAME" | Set-Content -Encoding ascii "$env:ASSET_PATH.sha256"
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.release_tag.outputs.tag }}"
+          $prerelease = "${{ inputs.prerelease }}"
+          $args = @(
+            "release", "create", $tag,
+            "$env:ASSET_PATH",
+            "$env:ASSET_PATH.sha256",
+            "--title", $tag,
+            "--notes", "CaptureCardPlayer $tag",
+            "--target", "${{ github.sha }}"
+          )
+
+          if ("${{ github.event_name }}" -eq "workflow_dispatch" -and $prerelease -eq "true") {
+            $args += "--prerelease"
+          }
+
+          gh @args
