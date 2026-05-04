@@ -40,6 +40,7 @@ internal sealed class PreviewForm : Form
     private readonly ContextMenuStrip deviceMenu = new();
     private DirectShowPreviewGraph? graph;
     private long lastMenuOpenedTicks;
+    private int volumePercent = 100;
 
     public PreviewForm(string? deviceSelector)
     {
@@ -67,6 +68,8 @@ internal sealed class PreviewForm : Form
 
         previewHost.Resize += (_, _) => graph?.Resize(previewHost.ClientSize);
         previewHost.MenuRequested += (_, point) => ShowDeviceMenu(point);
+        previewHost.WheelRequested += (_, delta) => ChangeVolume(delta);
+        MouseWheel += (_, e) => ChangeVolume(e.Delta);
         statusLabel.MouseUp += (_, e) =>
         {
             if (e.Button == MouseButtons.Right)
@@ -74,6 +77,7 @@ internal sealed class PreviewForm : Form
                 ShowDeviceMenu(statusLabel.PointToScreen(e.Location));
             }
         };
+        statusLabel.MouseWheel += (_, e) => ChangeVolume(e.Delta);
     }
 
     protected override void OnShown(EventArgs e)
@@ -95,8 +99,9 @@ internal sealed class PreviewForm : Form
         {
             DiagnosticLog.Write("Starting preview.");
             graph = DirectShowPreviewGraph.Start(previewHost.Handle, previewHost.ClientSize, currentDeviceSelector);
+            graph.SetVolumePercent(volumePercent);
             statusLabel.Visible = false;
-            Text = $"CaptureCardPlayer - {graph.DeviceName}";
+            UpdateWindowTitle();
             DiagnosticLog.Write($"Preview started: {graph.DeviceName}");
         }
         catch (Exception ex)
@@ -107,6 +112,26 @@ internal sealed class PreviewForm : Form
             graph?.Dispose();
             graph = null;
         }
+    }
+
+    private void ChangeVolume(int wheelDelta)
+    {
+        int direction = Math.Sign(wheelDelta);
+        if (direction == 0)
+        {
+            return;
+        }
+
+        volumePercent = Math.Clamp(volumePercent + (direction * 5), 0, 150);
+        graph?.SetVolumePercent(volumePercent);
+        UpdateWindowTitle();
+        DiagnosticLog.Write($"Volume changed: {volumePercent}%.");
+    }
+
+    private void UpdateWindowTitle()
+    {
+        string deviceName = graph?.DeviceName ?? "No Device";
+        Text = $"CaptureCardPlayer - {deviceName} - {volumePercent}%";
     }
 
     private void RestartPreview(string? selector)
@@ -170,8 +195,10 @@ internal sealed class PreviewForm : Form
 internal sealed class PreviewPanel : Panel
 {
     private const int WmContextMenu = 0x007B;
+    private const int WmMouseWheel = 0x020A;
 
     public event EventHandler<Point>? MenuRequested;
+    public event EventHandler<int>? WheelRequested;
 
     protected override void WndProc(ref Message m)
     {
@@ -179,6 +206,13 @@ internal sealed class PreviewPanel : Panel
         {
             Point point = GetContextMenuPoint(m.LParam);
             MenuRequested?.Invoke(this, point);
+            return;
+        }
+
+        if (m.Msg == WmMouseWheel)
+        {
+            int delta = unchecked((short)(((long)m.WParam >> 16) & 0xFFFF));
+            WheelRequested?.Invoke(this, delta);
             return;
         }
 
@@ -212,9 +246,11 @@ internal sealed class DirectShowPreviewGraph : IDisposable
     private IGraphBuilder? graphBuilder;
     private ICaptureGraphBuilder2? captureBuilder;
     private IBaseFilter? sourceFilter;
+    private IBaseFilter? audioSourceFilter;
     private IBaseFilter? rendererFilter;
     private IMediaControl? mediaControl;
     private IVideoWindow? videoWindow;
+    private IBasicAudio? basicAudio;
 
     private DirectShowPreviewGraph(string deviceName)
     {
@@ -272,15 +308,19 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         finally
         {
             ReleaseComObject(videoWindow);
+            ReleaseComObject(basicAudio);
             ReleaseComObject(mediaControl);
             ReleaseComObject(rendererFilter);
+            ReleaseComObject(audioSourceFilter);
             ReleaseComObject(sourceFilter);
             ReleaseComObject(captureBuilder);
             ReleaseComObject(graphBuilder);
 
             videoWindow = null;
+            basicAudio = null;
             mediaControl = null;
             rendererFilter = null;
+            audioSourceFilter = null;
             sourceFilter = null;
             captureBuilder = null;
             graphBuilder = null;
@@ -319,9 +359,12 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
         CheckHr(hr, "Failed to render the video capture stream.");
 
+        RenderAudioStream();
+
         DiagnosticLog.Write("Attaching video window.");
         mediaControl = (IMediaControl)graphBuilder;
         videoWindow = (IVideoWindow)graphBuilder;
+        basicAudio = graphBuilder as IBasicAudio;
 
         CheckHr(videoWindow.put_Owner(owner), "Failed to attach the video output window.");
         CheckHr(videoWindow.put_WindowStyle(WsChild | WsClipSiblings), "Failed to configure the video output window.");
@@ -331,6 +374,92 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
         DiagnosticLog.Write("Running graph.");
         CheckHr(mediaControl.Run(), "Failed to start the video capture device.");
+    }
+
+    public void SetVolumePercent(int percent)
+    {
+        int clampedPercent = Math.Clamp(percent, 0, 150);
+        if (basicAudio is null)
+        {
+            return;
+        }
+
+        int directShowVolume = ConvertToDirectShowVolume(clampedPercent);
+        int hr = basicAudio.put_Volume(directShowVolume);
+        if (hr < 0 && clampedPercent > 100)
+        {
+            hr = basicAudio.put_Volume(0);
+        }
+
+        if (hr < 0)
+        {
+            DiagnosticLog.Write($"Failed to set volume {clampedPercent}%: 0x{hr:X8}");
+        }
+    }
+
+    private void RenderAudioStream()
+    {
+        DiagnosticLog.Write("Rendering audio capture stream from video device.");
+        int hr = RenderAudioFromFilter(sourceFilter!);
+        if (hr >= 0)
+        {
+            DiagnosticLog.Write("Audio capture stream rendered from video device.");
+            return;
+        }
+
+        DiagnosticLog.Write($"Audio stream render from video device failed: 0x{hr:X8}");
+
+        if (!VideoCaptureDevices.TryBindMatchingAudioDevice(DeviceName, out audioSourceFilter, out string? audioDeviceName))
+        {
+            DiagnosticLog.Write("No matching separate audio capture device was found.");
+            return;
+        }
+
+        DiagnosticLog.Write($"Rendering matching separate audio device: {audioDeviceName}");
+        var filterGraph = (IFilterGraph)graphBuilder!;
+        hr = filterGraph.AddFilter(audioSourceFilter!, audioDeviceName!);
+        if (hr < 0)
+        {
+            DiagnosticLog.Write($"Failed to add separate audio device: 0x{hr:X8}");
+            return;
+        }
+
+        hr = RenderAudioFromFilter(audioSourceFilter!);
+        if (hr >= 0)
+        {
+            DiagnosticLog.Write("Audio capture stream rendered from separate audio device.");
+            return;
+        }
+
+        DiagnosticLog.Write($"Separate audio stream render failed: 0x{hr:X8}");
+    }
+
+    private int RenderAudioFromFilter(IBaseFilter filter)
+    {
+        Guid audioCategory = DirectShowGuids.PinCategoryCapture;
+        Guid audioType = DirectShowGuids.MediaTypeAudio;
+        int hr = captureBuilder!.RenderStream(ref audioCategory, ref audioType, filter, null, null);
+        if (hr >= 0)
+        {
+            return hr;
+        }
+
+        audioCategory = DirectShowGuids.PinCategoryPreview;
+        audioType = DirectShowGuids.MediaTypeAudio;
+        return captureBuilder.RenderStream(ref audioCategory, ref audioType, filter, null, null);
+    }
+
+    private static int ConvertToDirectShowVolume(int percent)
+    {
+        if (percent <= 0)
+        {
+            return -10000;
+        }
+
+        double linear = percent / 100.0;
+        double decibels = 20.0 * Math.Log10(linear);
+        int hundredthsOfDb = (int)Math.Round(decibels * 100.0);
+        return Math.Clamp(hundredthsOfDb, -10000, 1000);
     }
 
     private static T CreateComObject<T>(Guid classId)
@@ -426,6 +555,144 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
                 ReleaseComObject(enumMoniker);
                 ReleaseComObject(createDevEnum);
+            }
+        }
+
+        public static bool TryBindMatchingAudioDevice(
+            string videoDeviceName,
+            out IBaseFilter? audioFilter,
+            out string? audioDeviceName)
+        {
+            audioFilter = null;
+            audioDeviceName = null;
+
+            ICreateDevEnum? createDevEnum = null;
+            INativeEnumMoniker? enumMoniker = null;
+            var monikers = new List<INativeMoniker>();
+
+            try
+            {
+                createDevEnum = CreateComObject<ICreateDevEnum>(DirectShowGuids.CreateDevEnum);
+                Guid category = DirectShowGuids.AudioInputDeviceCategory;
+                int hr = createDevEnum.CreateClassEnumerator(ref category, out enumMoniker, 0);
+                if (hr == HrFalse || enumMoniker is null)
+                {
+                    return false;
+                }
+
+                CheckHr(hr, "Failed to enumerate audio capture devices.");
+
+                var candidates = new List<(int Index, string Name, int Score)>();
+                while (enumMoniker.Next(1, out INativeMoniker current, IntPtr.Zero) == HrSuccess)
+                {
+                    int index = monikers.Count;
+                    monikers.Add(current);
+
+                    string name = GetFriendlyName(current) ?? $"Audio Capture Device {index}";
+                    int score = ScoreAudioDeviceMatch(videoDeviceName, name);
+                    DiagnosticLog.Write($"Audio device candidate {index}: {name}, score {score}.");
+                    if (score > 0)
+                    {
+                        candidates.Add((index, name, score));
+                    }
+                }
+
+                if (candidates.Count == 0)
+                {
+                    return false;
+                }
+
+                (int selectedIndex, string selectedName, _) = candidates
+                    .OrderByDescending(candidate => candidate.Score)
+                    .ThenBy(candidate => candidate.Index)
+                    .First();
+
+                INativeMoniker selected = monikers[selectedIndex];
+                Guid baseFilterId = typeof(IBaseFilter).GUID;
+                CheckHr(
+                    selected.BindToObject(IntPtr.Zero, IntPtr.Zero, ref baseFilterId, out IntPtr sourcePointer),
+                    $"Failed to bind {selectedName} to IBaseFilter.");
+
+                try
+                {
+                    audioFilter = (IBaseFilter)Marshal.GetObjectForIUnknown(sourcePointer);
+                    audioDeviceName = selectedName;
+                    return true;
+                }
+                finally
+                {
+                    Marshal.Release(sourcePointer);
+                }
+            }
+            catch (Exception ex) when (ex is COMException or InvalidComObjectException)
+            {
+                DiagnosticLog.Write($"Failed to bind matching audio device: {ex}");
+                return false;
+            }
+            finally
+            {
+                foreach (INativeMoniker moniker in monikers)
+                {
+                    ReleaseComObject(moniker);
+                }
+
+                ReleaseComObject(enumMoniker);
+                ReleaseComObject(createDevEnum);
+            }
+        }
+
+        private static int ScoreAudioDeviceMatch(string videoDeviceName, string audioDeviceName)
+        {
+            string video = videoDeviceName.ToLowerInvariant();
+            string audio = audioDeviceName.ToLowerInvariant();
+
+            if (video == audio)
+            {
+                return 1000;
+            }
+
+            if (video.Contains(audio, StringComparison.OrdinalIgnoreCase) ||
+                audio.Contains(video, StringComparison.OrdinalIgnoreCase))
+            {
+                return 500;
+            }
+
+            int score = 0;
+            foreach (string token in GetDistinctiveTokens(video))
+            {
+                if (audio.Contains(token, StringComparison.OrdinalIgnoreCase))
+                {
+                    score += token.Length >= 6 ? 50 : 25;
+                }
+            }
+
+            return score;
+        }
+
+        private static IEnumerable<string> GetDistinctiveTokens(string value)
+        {
+            string[] commonWords =
+            [
+                "audio",
+                "broadcaster",
+                "camera",
+                "capture",
+                "device",
+                "directshow",
+                "input",
+                "microphone",
+                "virtual",
+                "video",
+            ];
+
+            foreach (string token in value.Split([' ', '-', '_', '(', ')', '[', ']', '.', ':'], StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (token.Length < 4 || commonWords.Contains(token))
+                {
+                    continue;
+                }
+
+                yield return token;
             }
         }
 
@@ -609,9 +876,11 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 internal static class DirectShowGuids
 {
     public static readonly Guid VideoInputDeviceCategory = new("860BB310-5D01-11D0-BD3B-00A0C911CE86");
+    public static readonly Guid AudioInputDeviceCategory = new("33D9A762-90C8-11D0-BD43-00A0C911CE86");
     public static readonly Guid PinCategoryPreview = new("FB6C4282-0353-11D1-905F-0000C0CC16BA");
     public static readonly Guid PinCategoryCapture = new("FB6C4281-0353-11D1-905F-0000C0CC16BA");
     public static readonly Guid MediaTypeVideo = new("73646976-0000-0010-8000-00AA00389B71");
+    public static readonly Guid MediaTypeAudio = new("73647561-0000-0010-8000-00AA00389B71");
     public static readonly Guid FilterGraph = new("E436EBB3-524F-11CE-9F53-0020AF0BA770");
     public static readonly Guid CaptureGraphBuilder2 = new("BF87B6E1-8C27-11D0-B3F0-00AA003761C5");
     public static readonly Guid CreateDevEnum = new("62BE5D10-60EB-11D0-BD3B-00A0C911CE86");
@@ -710,6 +979,24 @@ internal interface IMediaControl
 
     [PreserveSig]
     int StopWhenReady();
+}
+
+[ComImport]
+[Guid("56A868B3-0AD4-11CE-B03A-0020AF0BA770")]
+[InterfaceType(ComInterfaceType.InterfaceIsDual)]
+internal interface IBasicAudio
+{
+    [PreserveSig]
+    int put_Volume(int volume);
+
+    [PreserveSig]
+    int get_Volume(out int volume);
+
+    [PreserveSig]
+    int put_Balance(int balance);
+
+    [PreserveSig]
+    int get_Balance(out int balance);
 }
 
 [ComImport]
