@@ -232,9 +232,17 @@ internal sealed class DirectShowPreviewGraph : IDisposable
     private static T CreateComObject<T>(Guid classId)
     {
         Guid interfaceId = typeof(T).GUID;
-        int hr = CoCreateInstance(ref classId, IntPtr.Zero, ClsctxInprocServer, ref interfaceId, out object instance);
+        int hr = CoCreateInstance(ref classId, IntPtr.Zero, ClsctxInprocServer, ref interfaceId, out IntPtr instance);
         CheckHr(hr, $"Failed to create COM object {classId}.");
-        return (T)instance;
+
+        try
+        {
+            return (T)Marshal.GetObjectForIUnknown(instance);
+        }
+        finally
+        {
+            Marshal.Release(instance);
+        }
     }
 
     [DllImport("ole32.dll", ExactSpelling = true, PreserveSig = true)]
@@ -243,7 +251,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         IntPtr outer,
         uint context,
         ref Guid interfaceId,
-        [MarshalAs(UnmanagedType.Interface)] out object instance);
+        out IntPtr instance);
 
     private static void CheckHr(int hr, string message)
     {
@@ -286,8 +294,10 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
             try
             {
+                DiagnosticLog.Write("Creating System Device Enumerator.");
                 createDevEnum = CreateComObject<ICreateDevEnum>(DirectShowGuids.CreateDevEnum);
                 Guid category = DirectShowGuids.VideoInputDeviceCategory;
+                DiagnosticLog.Write("Calling CreateClassEnumerator.");
                 int hr = createDevEnum.CreateClassEnumerator(ref category, out enumMoniker, 0);
                 if (hr == HrFalse || enumMoniker is null)
                 {
@@ -296,9 +306,11 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
                 CheckHr(hr, "Failed to enumerate video capture devices.");
 
+                DiagnosticLog.Write("Reading monikers.");
                 var current = new IMoniker[1];
                 while (enumMoniker.Next(1, current, IntPtr.Zero) == HrSuccess)
                 {
+                    DiagnosticLog.Write("Found video capture moniker.");
                     monikers.Add(current[0]);
                     current = new IMoniker[1];
                 }
@@ -308,13 +320,35 @@ internal sealed class DirectShowPreviewGraph : IDisposable
                     throw new InvalidOperationException("No video capture device was found.");
                 }
 
-                int selectedIndex = SelectDevice(monikers, selector);
-                IMoniker selected = monikers[selectedIndex];
-                deviceName = GetFriendlyName(selected) ?? $"Video Capture Device {selectedIndex}";
+                DiagnosticLog.Write($"Selecting from {monikers.Count} video capture device(s).");
+                List<string> failures = new();
+                foreach (int selectedIndex in BuildCandidateOrder(monikers, selector))
+                {
+                    IMoniker selected = monikers[selectedIndex];
+                    string candidateName = GetFriendlyName(selected) ?? $"Video Capture Device {selectedIndex}";
+                    DiagnosticLog.Write($"Trying device {selectedIndex}: {candidateName}.");
 
-                Guid baseFilterId = typeof(IBaseFilter).GUID;
-                selected.BindToObject(null!, null!, ref baseFilterId, out object sourceObject);
-                return (IBaseFilter)sourceObject;
+                    try
+                    {
+                        Guid baseFilterId = typeof(IBaseFilter).GUID;
+                        DiagnosticLog.Write("Binding selected moniker to IBaseFilter.");
+                        selected.BindToObject(null!, null!, ref baseFilterId, out object sourceObject);
+                        DiagnosticLog.Write("Selected moniker bound to IBaseFilter.");
+                        deviceName = candidateName;
+                        return (IBaseFilter)sourceObject;
+                    }
+                    catch (Exception ex) when (ex is COMException or InvalidComObjectException)
+                    {
+                        string failure = $"{candidateName}: {ex.Message}";
+                        failures.Add(failure);
+                        DiagnosticLog.Write($"Device bind failed: {failure}");
+                    }
+                }
+
+                throw new InvalidOperationException(
+                    "No usable video capture device was found." +
+                    Environment.NewLine +
+                    string.Join(Environment.NewLine, failures));
             }
             finally
             {
@@ -328,16 +362,22 @@ internal sealed class DirectShowPreviewGraph : IDisposable
             }
         }
 
-        private static int SelectDevice(IReadOnlyList<IMoniker> monikers, string? selector)
+        private static IEnumerable<int> BuildCandidateOrder(IReadOnlyList<IMoniker> monikers, string? selector)
         {
             if (string.IsNullOrWhiteSpace(selector))
             {
-                return 0;
+                for (int i = 0; i < monikers.Count; i++)
+                {
+                    yield return i;
+                }
+
+                yield break;
             }
 
             if (int.TryParse(selector, out int index) && index >= 0 && index < monikers.Count)
             {
-                return index;
+                yield return index;
+                yield break;
             }
 
             for (int i = 0; i < monikers.Count; i++)
@@ -345,11 +385,9 @@ internal sealed class DirectShowPreviewGraph : IDisposable
                 string? name = GetFriendlyName(monikers[i]);
                 if (name?.Contains(selector, StringComparison.OrdinalIgnoreCase) == true)
                 {
-                    return i;
+                    yield return i;
                 }
             }
-
-            return 0;
         }
 
         private static string? GetFriendlyName(IMoniker moniker)
