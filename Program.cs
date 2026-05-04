@@ -106,6 +106,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
     private const int WsClipSiblings = 0x04000000;
     private const int HrSuccess = 0;
     private const int HrFalse = 1;
+    private const uint ClsctxInprocServer = 0x1;
 
     private IGraphBuilder? graphBuilder;
     private ICaptureGraphBuilder2? captureBuilder;
@@ -220,9 +221,19 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
     private static T CreateComObject<T>(Guid classId)
     {
-        Type type = Type.GetTypeFromCLSID(classId, throwOnError: true)!;
-        return (T)Activator.CreateInstance(type)!;
+        Guid interfaceId = typeof(T).GUID;
+        int hr = CoCreateInstance(ref classId, IntPtr.Zero, ClsctxInprocServer, ref interfaceId, out object instance);
+        CheckHr(hr, $"Failed to create COM object {classId}.");
+        return (T)instance;
     }
+
+    [DllImport("ole32.dll", ExactSpelling = true, PreserveSig = true)]
+    private static extern int CoCreateInstance(
+        ref Guid classId,
+        IntPtr outer,
+        uint context,
+        ref Guid interfaceId,
+        [MarshalAs(UnmanagedType.Interface)] out object instance);
 
     private static void CheckHr(int hr, string message)
     {
