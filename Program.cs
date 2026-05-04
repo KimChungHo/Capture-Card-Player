@@ -39,6 +39,7 @@ internal sealed class PreviewForm : Form
     private readonly Label statusLabel = new();
     private readonly ContextMenuStrip deviceMenu = new();
     private DirectShowPreviewGraph? graph;
+    private long lastMenuOpenedTicks;
 
     public PreviewForm(string? deviceSelector)
     {
@@ -155,14 +156,20 @@ internal sealed class PreviewForm : Form
         refresh.Click += (_, _) => ShowDeviceMenu(screenPoint);
         deviceMenu.Items.Add(refresh);
 
-        deviceMenu.Show(screenPoint);
+        long nowTicks = Environment.TickCount64;
+        if (nowTicks - lastMenuOpenedTicks < 250)
+        {
+            return;
+        }
+
+        lastMenuOpenedTicks = nowTicks;
+        deviceMenu.Show(previewHost, previewHost.PointToClient(screenPoint));
     }
 }
 
 internal sealed class PreviewPanel : Panel
 {
     private const int WmContextMenu = 0x007B;
-    private const int WmRButtonUp = 0x0205;
 
     public event EventHandler<Point>? MenuRequested;
 
@@ -172,14 +179,6 @@ internal sealed class PreviewPanel : Panel
         {
             Point point = GetContextMenuPoint(m.LParam);
             MenuRequested?.Invoke(this, point);
-            return;
-        }
-
-        if (m.Msg == WmRButtonUp)
-        {
-            int x = unchecked((short)(long)m.LParam);
-            int y = unchecked((short)((long)m.LParam >> 16));
-            MenuRequested?.Invoke(this, PointToScreen(new Point(x, y)));
             return;
         }
 
