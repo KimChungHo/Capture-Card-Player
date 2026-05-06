@@ -80,7 +80,11 @@ internal sealed class PreviewForm : Form
         Controls.Add(statusLabel);
         statusLabel.BringToFront();
 
-        previewHost.Resize += (_, _) => graph?.Resize(previewHost.ClientSize);
+        previewHost.Resize += (_, _) =>
+        {
+            graph?.Resize(previewHost.ClientSize);
+            previewHost.Invalidate();
+        };
         previewHost.MenuRequested += (_, point) => ShowDeviceMenu(point);
         previewHost.SettingsRequested += (_, _) => ShowDeviceSettings();
         previewHost.WheelRequested += (_, delta) => ChangeVolume(delta);
@@ -254,7 +258,13 @@ internal sealed class PreviewForm : Form
 
     private Bitmap CapturePreviewArea()
     {
-        Rectangle bounds = previewHost.RectangleToScreen(previewHost.ClientRectangle);
+        Rectangle captureArea = graph?.VideoBounds ?? new Rectangle(Point.Empty, previewHost.ClientSize);
+        if (captureArea.Width <= 0 || captureArea.Height <= 0)
+        {
+            captureArea = new Rectangle(Point.Empty, previewHost.ClientSize);
+        }
+
+        Rectangle bounds = new(previewHost.PointToScreen(captureArea.Location), captureArea.Size);
         if (bounds.Width <= 0 || bounds.Height <= 0)
         {
             throw new InvalidOperationException("Preview area is empty.");
@@ -753,6 +763,8 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
     public Size CaptureSize { get; private set; }
 
+    public Rectangle VideoBounds { get; private set; } = Rectangle.Empty;
+
     public static IReadOnlyList<string> ListVideoCaptureDeviceNames()
     {
         Application.OleRequired();
@@ -818,9 +830,8 @@ internal sealed class DirectShowPreviewGraph : IDisposable
             return;
         }
 
-        int width = Math.Max(1, size.Width);
-        int height = Math.Max(1, size.Height);
-        _ = videoWindow.SetWindowPosition(0, 0, width, height);
+        VideoBounds = CalculateVideoBounds(size, CaptureSize);
+        _ = videoWindow.SetWindowPosition(VideoBounds.X, VideoBounds.Y, VideoBounds.Width, VideoBounds.Height);
     }
 
     public void Dispose()
@@ -978,6 +989,40 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         }
 
         DiagnosticLog.Write($"Separate audio stream render failed: 0x{hr:X8}");
+    }
+
+    private static Rectangle CalculateVideoBounds(Size containerSize, Size sourceSize)
+    {
+        int containerWidth = Math.Max(1, containerSize.Width);
+        int containerHeight = Math.Max(1, containerSize.Height);
+
+        if (sourceSize.Width <= 0 || sourceSize.Height <= 0)
+        {
+            return new Rectangle(0, 0, containerWidth, containerHeight);
+        }
+
+        double sourceAspect = sourceSize.Width / (double)sourceSize.Height;
+        double containerAspect = containerWidth / (double)containerHeight;
+
+        int width;
+        int height;
+        if (containerAspect > sourceAspect)
+        {
+            height = containerHeight;
+            width = Math.Max(1, (int)Math.Round(height * sourceAspect));
+        }
+        else
+        {
+            width = containerWidth;
+            height = Math.Max(1, (int)Math.Round(width / sourceAspect));
+        }
+
+        width = Math.Min(width, containerWidth);
+        height = Math.Min(height, containerHeight);
+
+        int x = (containerWidth - width) / 2;
+        int y = (containerHeight - height) / 2;
+        return new Rectangle(x, y, width, height);
     }
 
     private int RenderAudioFromFilter(IBaseFilter filter)
