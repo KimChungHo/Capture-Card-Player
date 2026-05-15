@@ -258,6 +258,11 @@ internal sealed class PreviewForm : Form
 
     private Bitmap CapturePreviewArea()
     {
+        if (graph is not null)
+        {
+            return graph.CaptureCurrentFrame();
+        }
+
         Rectangle captureArea = graph?.VideoBounds ?? new Rectangle(Point.Empty, previewHost.ClientSize);
         if (captureArea.Width <= 0 || captureArea.Height <= 0)
         {
@@ -749,6 +754,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
     private IMediaControl? mediaControl;
     private IVideoWindow? videoWindow;
     private IBasicAudio? basicAudio;
+    private IBasicVideo? basicVideo;
 
     private DirectShowPreviewGraph(string deviceName)
     {
@@ -849,6 +855,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         {
             ReleaseComObject(videoWindow);
             ReleaseComObject(basicAudio);
+            ReleaseComObject(basicVideo);
             ReleaseComObject(mediaControl);
             ReleaseComObject(rendererFilter);
             ReleaseComObject(audioSourceFilter);
@@ -858,6 +865,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
             videoWindow = null;
             basicAudio = null;
+            basicVideo = null;
             mediaControl = null;
             rendererFilter = null;
             audioSourceFilter = null;
@@ -922,6 +930,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         mediaControl = (IMediaControl)graphBuilder;
         videoWindow = (IVideoWindow)graphBuilder;
         basicAudio = graphBuilder as IBasicAudio;
+        basicVideo = graphBuilder as IBasicVideo;
 
         CheckHr(videoWindow.put_Owner(owner), "Failed to attach the video output window.");
         CheckHr(videoWindow.put_WindowStyle(WsChild | WsClipSiblings), "Failed to configure the video output window.");
@@ -952,6 +961,124 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         {
             DiagnosticLog.Write($"Failed to set volume {clampedPercent}%: 0x{hr:X8}");
         }
+    }
+
+    public Bitmap CaptureCurrentFrame()
+    {
+        try
+        {
+            return CaptureCurrentFrameFromRenderer();
+        }
+        catch (Exception ex) when (mediaControl is not null)
+        {
+            DiagnosticLog.Write($"Frame capture while running failed. Retrying while paused: {ex}");
+            int pauseHr = mediaControl.Pause();
+            if (pauseHr < 0)
+            {
+                throw;
+            }
+
+            try
+            {
+                _ = mediaControl.GetState(1000, out _);
+                return CaptureCurrentFrameFromRenderer();
+            }
+            finally
+            {
+                _ = mediaControl.Run();
+            }
+        }
+    }
+
+    private Bitmap CaptureCurrentFrameFromRenderer()
+    {
+        if (basicVideo is null)
+        {
+            throw new InvalidOperationException("The video renderer does not expose frame capture.");
+        }
+
+        int bufferSize = 0;
+        int hr = basicVideo.GetCurrentImage(ref bufferSize, IntPtr.Zero);
+        if (bufferSize <= 0)
+        {
+            CheckHr(hr, "Failed to query the current video frame size.");
+        }
+
+        if (bufferSize <= 0)
+        {
+            throw new InvalidOperationException("The video renderer returned an empty frame.");
+        }
+
+        IntPtr buffer = Marshal.AllocCoTaskMem(bufferSize);
+        try
+        {
+            hr = basicVideo.GetCurrentImage(ref bufferSize, buffer);
+            CheckHr(hr, "Failed to capture the current video frame.");
+            return CreateBitmapFromDib(buffer, bufferSize);
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(buffer);
+        }
+    }
+
+    private static Bitmap CreateBitmapFromDib(IntPtr dibPointer, int dibSize)
+    {
+        int pixelOffset = CalculateDibPixelOffset(dibPointer, dibSize);
+        byte[] dibBytes = new byte[dibSize];
+        Marshal.Copy(dibPointer, dibBytes, 0, dibSize);
+
+        using var stream = new MemoryStream(14 + dibSize);
+        using (var writer = new BinaryWriter(stream, System.Text.Encoding.ASCII, leaveOpen: true))
+        {
+            writer.Write((byte)'B');
+            writer.Write((byte)'M');
+            writer.Write(14 + dibSize);
+            writer.Write((short)0);
+            writer.Write((short)0);
+            writer.Write(14 + pixelOffset);
+            writer.Write(dibBytes);
+        }
+
+        stream.Position = 0;
+        using var bitmap = new Bitmap(stream);
+        return new Bitmap(bitmap);
+    }
+
+    private static int CalculateDibPixelOffset(IntPtr dibPointer, int dibSize)
+    {
+        if (dibSize < Marshal.SizeOf<BitmapInfoHeader>())
+        {
+            throw new InvalidOperationException("The captured frame is not a valid DIB image.");
+        }
+
+        int headerSize = Marshal.ReadInt32(dibPointer);
+        if (headerSize <= 0 || headerSize > dibSize)
+        {
+            throw new InvalidOperationException("The captured frame has an invalid bitmap header.");
+        }
+
+        short bitCount = Marshal.ReadInt16(dibPointer, 14);
+        int compression = Marshal.ReadInt32(dibPointer, 16);
+        int colorsUsed = Marshal.ReadInt32(dibPointer, 32);
+        int colorTableEntries = colorsUsed > 0
+            ? colorsUsed
+            : bitCount is > 0 and <= 8
+                ? 1 << bitCount
+                : 0;
+
+        long pixelOffset = headerSize + (colorTableEntries * 4L);
+        if (compression == 3 && headerSize == Marshal.SizeOf<BitmapInfoHeader>() && bitCount is 16 or 32)
+        {
+            pixelOffset += 12;
+        }
+
+        if (pixelOffset <= 0 || pixelOffset > dibSize)
+        {
+            throw new InvalidOperationException("The captured frame has an invalid bitmap payload.");
+        }
+
+        return (int)pixelOffset;
     }
 
     private void RenderAudioStream()
@@ -2032,6 +2159,108 @@ internal interface IBasicAudio
 
     [PreserveSig]
     int get_Balance(out int balance);
+}
+
+[ComImport]
+[Guid("56A868B5-0AD4-11CE-B03A-0020AF0BA770")]
+[InterfaceType(ComInterfaceType.InterfaceIsDual)]
+internal interface IBasicVideo
+{
+    [PreserveSig]
+    int get_AvgTimePerFrame(out double avgTimePerFrame);
+
+    [PreserveSig]
+    int get_BitRate(out int bitRate);
+
+    [PreserveSig]
+    int get_BitErrorRate(out int bitErrorRate);
+
+    [PreserveSig]
+    int get_VideoWidth(out int videoWidth);
+
+    [PreserveSig]
+    int get_VideoHeight(out int videoHeight);
+
+    [PreserveSig]
+    int put_SourceLeft(int sourceLeft);
+
+    [PreserveSig]
+    int get_SourceLeft(out int sourceLeft);
+
+    [PreserveSig]
+    int put_SourceWidth(int sourceWidth);
+
+    [PreserveSig]
+    int get_SourceWidth(out int sourceWidth);
+
+    [PreserveSig]
+    int put_SourceTop(int sourceTop);
+
+    [PreserveSig]
+    int get_SourceTop(out int sourceTop);
+
+    [PreserveSig]
+    int put_SourceHeight(int sourceHeight);
+
+    [PreserveSig]
+    int get_SourceHeight(out int sourceHeight);
+
+    [PreserveSig]
+    int put_DestinationLeft(int destinationLeft);
+
+    [PreserveSig]
+    int get_DestinationLeft(out int destinationLeft);
+
+    [PreserveSig]
+    int put_DestinationWidth(int destinationWidth);
+
+    [PreserveSig]
+    int get_DestinationWidth(out int destinationWidth);
+
+    [PreserveSig]
+    int put_DestinationTop(int destinationTop);
+
+    [PreserveSig]
+    int get_DestinationTop(out int destinationTop);
+
+    [PreserveSig]
+    int put_DestinationHeight(int destinationHeight);
+
+    [PreserveSig]
+    int get_DestinationHeight(out int destinationHeight);
+
+    [PreserveSig]
+    int SetSourcePosition(int left, int top, int width, int height);
+
+    [PreserveSig]
+    int GetSourcePosition(out int left, out int top, out int width, out int height);
+
+    [PreserveSig]
+    int SetDefaultSourcePosition();
+
+    [PreserveSig]
+    int SetDestinationPosition(int left, int top, int width, int height);
+
+    [PreserveSig]
+    int GetDestinationPosition(out int left, out int top, out int width, out int height);
+
+    [PreserveSig]
+    int SetDefaultDestinationPosition();
+
+    [PreserveSig]
+    int GetVideoSize(out int width, out int height);
+
+    [PreserveSig]
+    int GetVideoPaletteEntries(int startIndex, int entries, out int entriesReturned, IntPtr palette);
+
+    [PreserveSig]
+    int GetCurrentImage(ref int bufferSize, IntPtr dibImage);
+
+    [PreserveSig]
+    int IsUsingDefaultSource();
+
+    [PreserveSig]
+    int IsUsingDefaultDestination();
 }
 
 [ComImport]
