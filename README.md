@@ -17,3 +17,7 @@ Right-click to select a capture device.
 Double-click to select the source format.
 
 Use the mouse wheel to adjust the sound volume.
+
+## Contributors
+
+- Daeboroid
