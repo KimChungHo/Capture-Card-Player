@@ -8,6 +8,8 @@
 
 마우스 휠로 사운드 볼륨을 조절하세요.
 
+이 프로그램을 사용하는 동안에는 화면보호기가 작동하지 않습니다.
+
 ---
 
 You can easily preview the capture card source.
@@ -17,6 +19,9 @@ Right-click to select a capture device.
 Double-click to select the source format.
 
 Use the mouse wheel to adjust the sound volume.
+
+The screensaver does not operate while using this program.
+
 
 ## Contributors
 
