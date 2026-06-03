@@ -10,6 +10,7 @@ internal static class Program
         Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
+        using var screenSaverBlocker = ScreenSaverBlocker.Start();
         Application.Run(new PreviewForm(ParseDeviceSelector(args)));
     }
 
@@ -29,6 +30,55 @@ internal static class Program
         }
 
         return null;
+    }
+}
+
+internal sealed class ScreenSaverBlocker : IDisposable
+{
+    private const ExecutionState PreventScreenSaver = ExecutionState.Continuous | ExecutionState.DisplayRequired;
+
+    private bool active;
+
+    private ScreenSaverBlocker()
+    {
+    }
+
+    public static ScreenSaverBlocker Start()
+    {
+        var blocker = new ScreenSaverBlocker();
+        blocker.active = SetThreadExecutionState(PreventScreenSaver) != 0;
+
+        if (!blocker.active)
+        {
+            DiagnosticLog.Write($"Failed to disable screen saver: {Marshal.GetLastWin32Error()}");
+        }
+
+        return blocker;
+    }
+
+    public void Dispose()
+    {
+        if (!active)
+        {
+            return;
+        }
+
+        if (SetThreadExecutionState(ExecutionState.Continuous) == 0)
+        {
+            DiagnosticLog.Write($"Failed to restore screen saver state: {Marshal.GetLastWin32Error()}");
+        }
+
+        active = false;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern ExecutionState SetThreadExecutionState(ExecutionState esFlags);
+
+    [Flags]
+    private enum ExecutionState : uint
+    {
+        Continuous = 0x80000000,
+        DisplayRequired = 0x00000002,
     }
 }
 
