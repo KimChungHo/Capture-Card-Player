@@ -26,3 +26,4 @@ The screensaver does not operate while using this program.
 ## Contributors
 
 - Daeboroid
+- withasta
