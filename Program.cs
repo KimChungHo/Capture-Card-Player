@@ -308,12 +308,20 @@ internal sealed class PreviewForm : Form
 
     private Bitmap CapturePreviewArea()
     {
-        if (graph is not null)
+        DirectShowPreviewGraph? currentGraph = graph;
+        if (currentGraph is not null)
         {
-            return graph.CaptureCurrentFrame();
+            try
+            {
+                return currentGraph.CaptureCurrentFrame();
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLog.Write($"Renderer frame capture failed. Falling back to screen capture: {ex}");
+            }
         }
 
-        Rectangle captureArea = graph?.VideoBounds ?? new Rectangle(Point.Empty, previewHost.ClientSize);
+        Rectangle captureArea = currentGraph?.VideoBounds ?? new Rectangle(Point.Empty, previewHost.ClientSize);
         if (captureArea.Width <= 0 || captureArea.Height <= 0)
         {
             captureArea = new Rectangle(Point.Empty, previewHost.ClientSize);
@@ -329,7 +337,7 @@ internal sealed class PreviewForm : Form
         using Graphics graphics = Graphics.FromImage(bitmap);
         graphics.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size, CopyPixelOperation.SourceCopy);
 
-        Size targetSize = graph?.CaptureSize ?? Size.Empty;
+        Size targetSize = currentGraph?.CaptureSize ?? Size.Empty;
         if (targetSize.Width <= 0 || targetSize.Height <= 0 || targetSize == bitmap.Size)
         {
             return bitmap;
@@ -800,11 +808,14 @@ internal sealed class DirectShowPreviewGraph : IDisposable
     private ICaptureGraphBuilder2? captureBuilder;
     private IBaseFilter? sourceFilter;
     private IBaseFilter? audioSourceFilter;
+    private IBaseFilter? sampleGrabberFilter;
     private IBaseFilter? rendererFilter;
+    private ISampleGrabber? sampleGrabber;
     private IMediaControl? mediaControl;
     private IVideoWindow? videoWindow;
     private IBasicAudio? basicAudio;
     private IBasicVideo? basicVideo;
+    private VideoSampleFormat? sampleGrabberFormat;
 
     private DirectShowPreviewGraph(string deviceName)
     {
@@ -908,6 +919,8 @@ internal sealed class DirectShowPreviewGraph : IDisposable
             ReleaseComObject(basicVideo);
             ReleaseComObject(mediaControl);
             ReleaseComObject(rendererFilter);
+            ReleaseComObject(sampleGrabber);
+            ReleaseComObject(sampleGrabberFilter);
             ReleaseComObject(audioSourceFilter);
             ReleaseComObject(sourceFilter);
             ReleaseComObject(captureBuilder);
@@ -918,6 +931,9 @@ internal sealed class DirectShowPreviewGraph : IDisposable
             basicVideo = null;
             mediaControl = null;
             rendererFilter = null;
+            sampleGrabber = null;
+            sampleGrabberFilter = null;
+            sampleGrabberFormat = null;
             audioSourceFilter = null;
             sourceFilter = null;
             captureBuilder = null;
@@ -956,22 +972,28 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         rendererFilter = CreateComObject<IBaseFilter>(DirectShowGuids.VideoRenderer);
         CheckHr(filterGraph.AddFilter(rendererFilter, "Video Renderer"), "Failed to add the video renderer.");
 
-        Guid category = DirectShowGuids.PinCategoryPreview;
-        Guid mediaType = DirectShowGuids.MediaTypeVideo;
-        int hr = captureBuilder.RenderStream(ref category, ref mediaType, sourceFilter, null, rendererFilter);
-        if (hr < 0)
+        TryCreateFrameGrabber(filterGraph);
+
+        int hr = RenderVideoStream(sampleGrabberFilter);
+        if (hr < 0 && sampleGrabberFilter is not null)
         {
-            category = DirectShowGuids.PinCategoryCapture;
-            hr = captureBuilder.RenderStream(ref category, ref mediaType, sourceFilter, null, rendererFilter);
+            DiagnosticLog.Write($"Video stream render with frame grabber failed: 0x{hr:X8}. Retrying without frame grabber.");
+            RemoveFrameGrabber(filterGraph);
+            hr = RenderVideoStream(null);
         }
 
         CheckHr(hr, "Failed to render the video capture stream.");
+        sampleGrabberFormat = TryReadFrameGrabberFormat();
 
         if (CaptureSize.IsEmpty)
         {
-            CaptureFormatOption? currentVideoFormat = GetCurrentVideoFormat();
-            CaptureSize = currentVideoFormat?.Size ?? Size.Empty;
-            FormatName = currentVideoFormat?.DisplayName ?? CaptureFormatOption.DeviceDefault.DisplayName;
+            CaptureSize = sampleGrabberFormat?.Size ?? Size.Empty;
+            if (CaptureSize.IsEmpty)
+            {
+                CaptureFormatOption? currentVideoFormat = GetCurrentVideoFormat();
+                CaptureSize = currentVideoFormat?.Size ?? Size.Empty;
+                FormatName = currentVideoFormat?.DisplayName ?? CaptureFormatOption.DeviceDefault.DisplayName;
+            }
         }
 
         RenderAudioStream();
@@ -990,6 +1012,103 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
         DiagnosticLog.Write("Running graph.");
         CheckHr(mediaControl.Run(), "Failed to start the video capture device.");
+    }
+
+    private void TryCreateFrameGrabber(IFilterGraph filterGraph)
+    {
+        try
+        {
+            DiagnosticLog.Write("Creating SampleGrabber.");
+            sampleGrabberFilter = CreateComObject<IBaseFilter>(DirectShowGuids.SampleGrabber);
+            sampleGrabber = (ISampleGrabber)sampleGrabberFilter;
+
+            var mediaType = new AMMediaType
+            {
+                MajorType = DirectShowGuids.MediaTypeVideo,
+                SubType = DirectShowGuids.MediaSubtypeRgb24,
+                FormatType = DirectShowGuids.FormatVideoInfo,
+            };
+
+            CheckHr(sampleGrabber.SetMediaType(ref mediaType), "Failed to configure frame grabber media type.");
+            CheckHr(sampleGrabber.SetBufferSamples(true), "Failed to enable frame grabber buffering.");
+            CheckHr(sampleGrabber.SetOneShot(false), "Failed to configure continuous frame grabbing.");
+            CheckHr(filterGraph.AddFilter(sampleGrabberFilter, "Frame Grabber"), "Failed to add frame grabber.");
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"Frame grabber is unavailable: {ex}");
+            ReleaseComObject(sampleGrabber);
+            ReleaseComObject(sampleGrabberFilter);
+            sampleGrabber = null;
+            sampleGrabberFilter = null;
+            sampleGrabberFormat = null;
+        }
+    }
+
+    private int RenderVideoStream(IBaseFilter? intermediateFilter)
+    {
+        Guid category = DirectShowGuids.PinCategoryPreview;
+        Guid mediaType = DirectShowGuids.MediaTypeVideo;
+        int hr = captureBuilder!.RenderStream(ref category, ref mediaType, sourceFilter!, intermediateFilter, rendererFilter);
+        if (hr >= 0)
+        {
+            return hr;
+        }
+
+        category = DirectShowGuids.PinCategoryCapture;
+        mediaType = DirectShowGuids.MediaTypeVideo;
+        return captureBuilder.RenderStream(ref category, ref mediaType, sourceFilter!, intermediateFilter, rendererFilter);
+    }
+
+    private void RemoveFrameGrabber(IFilterGraph filterGraph)
+    {
+        sampleGrabberFormat = null;
+        ReleaseComObject(sampleGrabber);
+        sampleGrabber = null;
+
+        if (sampleGrabberFilter is not null)
+        {
+            int removeHr = filterGraph.RemoveFilter(sampleGrabberFilter);
+            if (removeHr < 0)
+            {
+                DiagnosticLog.Write($"Failed to remove frame grabber after render failure: 0x{removeHr:X8}");
+            }
+
+            ReleaseComObject(sampleGrabberFilter);
+            sampleGrabberFilter = null;
+        }
+    }
+
+    private VideoSampleFormat? TryReadFrameGrabberFormat()
+    {
+        if (sampleGrabber is null)
+        {
+            return null;
+        }
+
+        IntPtr mediaTypePointer = Marshal.AllocCoTaskMem(Marshal.SizeOf<AMMediaType>());
+        try
+        {
+            Marshal.StructureToPtr(default(AMMediaType), mediaTypePointer, false);
+            int hr = sampleGrabber.GetConnectedMediaType(mediaTypePointer);
+            if (hr < 0)
+            {
+                DiagnosticLog.Write($"Failed to read frame grabber media type: 0x{hr:X8}");
+                return null;
+            }
+
+            AMMediaType mediaType = Marshal.PtrToStructure<AMMediaType>(mediaTypePointer);
+            return VideoSampleFormat.TryCreate(mediaType);
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"Failed to parse frame grabber media type: {ex}");
+            return null;
+        }
+        finally
+        {
+            ReleaseMediaType(mediaTypePointer);
+        }
     }
 
     public void SetVolumePercent(int percent)
@@ -1017,27 +1136,86 @@ internal sealed class DirectShowPreviewGraph : IDisposable
     {
         try
         {
+            return CaptureCurrentFrameFromSampleGrabber();
+        }
+        catch (Exception ex) when (basicVideo is not null)
+        {
+            DiagnosticLog.Write($"Frame grabber capture failed. Falling back to video renderer capture: {ex}");
             return CaptureCurrentFrameFromRenderer();
         }
-        catch (Exception ex) when (mediaControl is not null)
-        {
-            DiagnosticLog.Write($"Frame capture while running failed. Retrying while paused: {ex}");
-            int pauseHr = mediaControl.Pause();
-            if (pauseHr < 0)
-            {
-                throw;
-            }
+    }
 
-            try
+    private Bitmap CaptureCurrentFrameFromSampleGrabber()
+    {
+        if (sampleGrabber is null || sampleGrabberFormat is null)
+        {
+            throw new InvalidOperationException("The frame grabber is not available.");
+        }
+
+        int bufferSize = 0;
+        int hr = sampleGrabber.GetCurrentBuffer(ref bufferSize, IntPtr.Zero);
+        if (bufferSize <= 0)
+        {
+            CheckHr(hr, "Failed to query the current frame buffer size.");
+        }
+
+        if (bufferSize <= 0)
+        {
+            throw new InvalidOperationException("The frame grabber returned an empty frame.");
+        }
+
+        IntPtr buffer = Marshal.AllocCoTaskMem(bufferSize);
+        try
+        {
+            hr = sampleGrabber.GetCurrentBuffer(ref bufferSize, buffer);
+            CheckHr(hr, "Failed to copy the current frame buffer.");
+            return CreateBitmapFromSampleBuffer(buffer, bufferSize, sampleGrabberFormat);
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(buffer);
+        }
+    }
+
+    private static Bitmap CreateBitmapFromSampleBuffer(IntPtr buffer, int bufferSize, VideoSampleFormat format)
+    {
+        int expectedSize = format.Stride * format.Height;
+        if (bufferSize < expectedSize)
+        {
+            throw new InvalidOperationException("The captured frame buffer is smaller than the connected video format.");
+        }
+
+        System.Drawing.Imaging.PixelFormat pixelFormat = format.BitCount == 32
+            ? System.Drawing.Imaging.PixelFormat.Format32bppRgb
+            : System.Drawing.Imaging.PixelFormat.Format24bppRgb;
+
+        var bitmap = new Bitmap(format.Width, format.Height, pixelFormat);
+        System.Drawing.Imaging.BitmapData bitmapData = bitmap.LockBits(
+            new Rectangle(0, 0, format.Width, format.Height),
+            System.Drawing.Imaging.ImageLockMode.WriteOnly,
+            pixelFormat);
+
+        try
+        {
+            int rowBytes = format.Width * (format.BitCount / 8);
+            byte[] row = new byte[rowBytes];
+
+            for (int y = 0; y < format.Height; y++)
             {
-                _ = mediaControl.GetState(1000, out _);
-                return CaptureCurrentFrameFromRenderer();
-            }
-            finally
-            {
-                _ = mediaControl.Run();
+                int sourceY = format.IsBottomUp ? format.Height - 1 - y : y;
+                IntPtr sourceRow = IntPtr.Add(buffer, sourceY * format.Stride);
+                IntPtr targetRow = IntPtr.Add(bitmapData.Scan0, y * bitmapData.Stride);
+
+                Marshal.Copy(sourceRow, row, 0, rowBytes);
+                Marshal.Copy(row, 0, targetRow, rowBytes);
             }
         }
+        finally
+        {
+            bitmap.UnlockBits(bitmapData);
+        }
+
+        return bitmap;
     }
 
     private Bitmap CaptureCurrentFrameFromRenderer()
@@ -1899,6 +2077,9 @@ internal static class DirectShowGuids
     public static readonly Guid CaptureGraphBuilder2 = new("BF87B6E1-8C27-11D0-B3F0-00AA003761C5");
     public static readonly Guid CreateDevEnum = new("62BE5D10-60EB-11D0-BD3B-00A0C911CE86");
     public static readonly Guid VideoRenderer = new("70E102B0-5556-11CE-97C0-00AA0055595A");
+    public static readonly Guid SampleGrabber = new("C1F400A0-3F08-11D3-9F0B-006008039E37");
+    public static readonly Guid MediaSubtypeRgb24 = new("E436EB7D-524F-11CE-9F53-0020AF0BA770");
+    public static readonly Guid MediaSubtypeRgb32 = new("E436EB7E-524F-11CE-9F53-0020AF0BA770");
 
     public static IReadOnlyDictionary<Guid, string> VideoSubtypeNames { get; } = new Dictionary<Guid, string>
     {
@@ -2000,6 +2181,57 @@ internal struct VideoInfoHeader2
     public int ControlFlags;
     public int Reserved2;
     public BitmapInfoHeader BitmapInfoHeader;
+}
+
+internal sealed record VideoSampleFormat(
+    int Width,
+    int Height,
+    int BitCount,
+    int Stride,
+    bool IsBottomUp)
+{
+    public Size Size => new(Width, Height);
+
+    public static VideoSampleFormat? TryCreate(AMMediaType mediaType)
+    {
+        if (mediaType.FormatPointer == IntPtr.Zero)
+        {
+            return null;
+        }
+
+        BitmapInfoHeader bitmapHeader;
+        if (mediaType.FormatType == DirectShowGuids.FormatVideoInfo)
+        {
+            VideoInfoHeader videoInfo = Marshal.PtrToStructure<VideoInfoHeader>(mediaType.FormatPointer);
+            bitmapHeader = videoInfo.BitmapInfoHeader;
+        }
+        else if (mediaType.FormatType == DirectShowGuids.FormatVideoInfo2)
+        {
+            VideoInfoHeader2 videoInfo = Marshal.PtrToStructure<VideoInfoHeader2>(mediaType.FormatPointer);
+            bitmapHeader = videoInfo.BitmapInfoHeader;
+        }
+        else
+        {
+            return null;
+        }
+
+        int width = Math.Abs(bitmapHeader.Width);
+        int height = Math.Abs(bitmapHeader.Height);
+        int bitCount = bitmapHeader.BitCount;
+        if (width <= 0 || height <= 0 || bitCount is not (24 or 32))
+        {
+            return null;
+        }
+
+        if (mediaType.SubType != DirectShowGuids.MediaSubtypeRgb24 &&
+            mediaType.SubType != DirectShowGuids.MediaSubtypeRgb32)
+        {
+            return null;
+        }
+
+        int stride = ((width * bitCount + 31) / 32) * 4;
+        return new VideoSampleFormat(width, height, bitCount, stride, bitmapHeader.Height > 0);
+    }
 }
 
 internal static class DiagnosticLog
@@ -2141,6 +2373,33 @@ internal interface IFilterGraph
 [Guid("56A86895-0AD4-11CE-B03A-0020AF0BA770")]
 [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 internal interface IBaseFilter;
+
+[ComImport]
+[Guid("6B652FFF-11FE-4FCE-92AD-0266B5D7C78F")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface ISampleGrabber
+{
+    [PreserveSig]
+    int SetOneShot([MarshalAs(UnmanagedType.Bool)] bool oneShot);
+
+    [PreserveSig]
+    int SetMediaType(ref AMMediaType mediaType);
+
+    [PreserveSig]
+    int GetConnectedMediaType(IntPtr mediaType);
+
+    [PreserveSig]
+    int SetBufferSamples([MarshalAs(UnmanagedType.Bool)] bool bufferThem);
+
+    [PreserveSig]
+    int GetCurrentBuffer(ref int bufferSize, IntPtr buffer);
+
+    [PreserveSig]
+    int GetCurrentSample(out IntPtr sample);
+
+    [PreserveSig]
+    int SetCallback(IntPtr callback, int callbackMethod);
+}
 
 [ComImport]
 [Guid("C6E13340-30AC-11D0-A18C-00A0C9118956")]
