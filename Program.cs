@@ -1171,7 +1171,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         // first compatible video output pin.
         hr = RenderStream(
             null,
-            DirectShowGuids.MediaTypeVideo,
+            null,
             sourceFilter!,
             intermediateFilter,
             rendererFilter);
@@ -1541,13 +1541,13 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
     private int RenderStream(
         Guid? category,
-        Guid mediaType,
+        Guid? mediaType,
         object source,
         IBaseFilter? compressor,
         IBaseFilter? renderer)
     {
         IntPtr categoryPointer = IntPtr.Zero;
-        IntPtr mediaTypePointer = Marshal.AllocCoTaskMem(Marshal.SizeOf<Guid>());
+        IntPtr mediaTypePointer = IntPtr.Zero;
         try
         {
             if (category.HasValue)
@@ -1556,7 +1556,12 @@ internal sealed class DirectShowPreviewGraph : IDisposable
                 Marshal.StructureToPtr(category.Value, categoryPointer, false);
             }
 
-            Marshal.StructureToPtr(mediaType, mediaTypePointer, false);
+            if (mediaType.HasValue)
+            {
+                mediaTypePointer = Marshal.AllocCoTaskMem(Marshal.SizeOf<Guid>());
+                Marshal.StructureToPtr(mediaType.Value, mediaTypePointer, false);
+            }
+
             return captureBuilder!.RenderStream(
                 categoryPointer,
                 mediaTypePointer,
@@ -1571,7 +1576,10 @@ internal sealed class DirectShowPreviewGraph : IDisposable
                 Marshal.FreeCoTaskMem(categoryPointer);
             }
 
-            Marshal.FreeCoTaskMem(mediaTypePointer);
+            if (mediaTypePointer != IntPtr.Zero)
+            {
+                Marshal.FreeCoTaskMem(mediaTypePointer);
+            }
         }
     }
 
