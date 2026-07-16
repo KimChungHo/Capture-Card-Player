@@ -10,26 +10,94 @@ internal static class Program
         Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
+
+        string? selfTestDevice = ParseArgument(args, "--self-test-device=", "/self-test-device=");
+        if (!string.IsNullOrWhiteSpace(selfTestDevice))
+        {
+            string? selfTestFormat = ParseArgument(args, "--self-test-format=", "/self-test-format=");
+            Environment.ExitCode = DirectShowDeviceSelfTest.Run(selfTestDevice, selfTestFormat);
+            return;
+        }
+
         using var screenSaverBlocker = ScreenSaverBlocker.Start();
         Application.Run(new PreviewForm(ParseDeviceSelector(args)));
     }
 
-    private static string? ParseDeviceSelector(string[] args)
+    private static string? ParseDeviceSelector(string[] args) =>
+        ParseArgument(args, "--device=", "/device=");
+
+    private static string? ParseArgument(string[] args, params string[] prefixes)
     {
         foreach (string arg in args)
         {
-            if (arg.StartsWith("--device=", StringComparison.OrdinalIgnoreCase))
+            foreach (string prefix in prefixes)
             {
-                return arg["--device=".Length..].Trim('"');
-            }
-
-            if (arg.StartsWith("/device=", StringComparison.OrdinalIgnoreCase))
-            {
-                return arg["/device=".Length..].Trim('"');
+                if (arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    return arg[prefix.Length..].Trim('"');
+                }
             }
         }
 
         return null;
+    }
+}
+
+internal static class DirectShowDeviceSelfTest
+{
+    public static int Run(string deviceSelector, string? formatSelector)
+    {
+        DiagnosticLog.Write(
+            $"Device self-test started: device={deviceSelector}, format={formatSelector ?? "default"}");
+
+        try
+        {
+            CaptureFormatOption? format = ResolveFormat(deviceSelector, formatSelector);
+            using var host = new Form
+            {
+                ClientSize = new Size(640, 360),
+                ShowInTaskbar = false,
+            };
+
+            _ = host.Handle;
+            using DirectShowPreviewGraph graph = DirectShowPreviewGraph.Start(
+                host.Handle,
+                host.ClientSize,
+                deviceSelector,
+                format);
+            graph.SetVolumePercent(0);
+            Application.DoEvents();
+            Thread.Sleep(750);
+
+            DiagnosticLog.Write(
+                $"Device self-test passed: device={graph.DeviceName}, format={graph.FormatName}");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"Device self-test failed: {ex}");
+            return 1;
+        }
+    }
+
+    private static CaptureFormatOption? ResolveFormat(string deviceSelector, string? formatSelector)
+    {
+        if (string.IsNullOrWhiteSpace(formatSelector))
+        {
+            return null;
+        }
+
+        IReadOnlyList<CaptureFormatOption> formats =
+            DirectShowPreviewGraph.ListVideoCaptureFormats(deviceSelector);
+        DiagnosticLog.Write(
+            $"Device self-test found {formats.Count} selectable format(s) for {deviceSelector}.");
+
+        CaptureFormatOption? format = formats.FirstOrDefault(candidate =>
+                string.Equals(candidate.Key, formatSelector, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(candidate.DisplayName, formatSelector, StringComparison.OrdinalIgnoreCase));
+
+        return format ?? throw new InvalidOperationException(
+            $"The self-test format was not found for {deviceSelector}: {formatSelector}");
     }
 }
 
@@ -188,7 +256,7 @@ internal sealed class PreviewForm : Form
         base.OnDeactivate(e);
     }
 
-    private void StartPreview(bool allowFallback = true)
+    private void StartPreview(bool allowFormatFallback = true)
     {
         try
         {
@@ -217,15 +285,14 @@ internal sealed class PreviewForm : Form
         catch (Exception ex)
         {
             DiagnosticLog.Write(ex.ToString());
-            if (allowFallback && (currentDeviceSelector is not null || currentFormat is not null))
+            if (allowFormatFallback && currentFormat is { IsDeviceDefault: false })
             {
-                DiagnosticLog.Write("Retrying startup with default device and default format.");
-                currentDeviceSelector = null;
+                DiagnosticLog.Write("Retrying the selected device with its default format.");
                 currentFormat = null;
                 SaveCurrentSettings();
                 graph?.Dispose();
                 graph = null;
-                StartPreview(allowFallback: false);
+                StartPreview(allowFormatFallback: false);
                 return;
             }
 
@@ -914,24 +981,22 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         }
         finally
         {
-            ReleaseComObject(videoWindow);
-            ReleaseComObject(basicAudio);
-            ReleaseComObject(basicVideo);
-            ReleaseComObject(mediaControl);
+            // These interfaces are aliases of graphBuilder's COM identity.
+            // Final-releasing any alias disconnects every RCW for the graph.
+            videoWindow = null;
+            basicAudio = null;
+            basicVideo = null;
+            mediaControl = null;
+            sampleGrabber = null;
+
             ReleaseComObject(rendererFilter);
-            ReleaseComObject(sampleGrabber);
             ReleaseComObject(sampleGrabberFilter);
             ReleaseComObject(audioSourceFilter);
             ReleaseComObject(sourceFilter);
             ReleaseComObject(captureBuilder);
             ReleaseComObject(graphBuilder);
 
-            videoWindow = null;
-            basicAudio = null;
-            basicVideo = null;
-            mediaControl = null;
             rendererFilter = null;
-            sampleGrabber = null;
             sampleGrabberFilter = null;
             sampleGrabberFormat = null;
             audioSourceFilter = null;
@@ -972,18 +1037,31 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         rendererFilter = CreateComObject<IBaseFilter>(DirectShowGuids.VideoRenderer);
         CheckHr(filterGraph.AddFilter(rendererFilter, "Video Renderer"), "Failed to add the video renderer.");
 
-        TryCreateFrameGrabber(filterGraph);
+        if (CanUseFrameGrabber(format))
+        {
+            TryCreateFrameGrabber(filterGraph);
+        }
+        else
+        {
+            DiagnosticLog.Write("Skipping frame grabber for this device or video format.");
+        }
 
         int hr = RenderVideoStream(sampleGrabberFilter);
         if (hr < 0 && sampleGrabberFilter is not null)
         {
             DiagnosticLog.Write($"Video stream render with frame grabber failed: 0x{hr:X8}. Retrying without frame grabber.");
-            RemoveFrameGrabber(filterGraph);
-            hr = RenderVideoStream(null);
+            hr = RenderVideoStreamWithoutFrameGrabber(filterGraph);
         }
 
         CheckHr(hr, "Failed to render the video capture stream.");
         sampleGrabberFormat = TryReadFrameGrabberFormat();
+        if (sampleGrabberFilter is not null && sampleGrabberFormat is null)
+        {
+            DiagnosticLog.Write(
+                "Frame grabber was not connected. Retrying the video stream without it.");
+            hr = RenderVideoStreamWithoutFrameGrabber(filterGraph);
+            CheckHr(hr, "Failed to render the video capture stream without the frame grabber.");
+        }
 
         if (CaptureSize.IsEmpty)
         {
@@ -1014,6 +1092,27 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         CheckHr(mediaControl.Run(), "Failed to start the video capture device.");
     }
 
+    private bool CanUseFrameGrabber(CaptureFormatOption? format)
+    {
+        if (format?.Subtype is "P010" or "NV12")
+        {
+            return false;
+        }
+
+        try
+        {
+            using ComReleaser<IAMStreamConfig> streamConfig =
+                FindVideoStreamConfig(captureBuilder!, sourceFilter!);
+            int hr = streamConfig.Value.GetNumberOfCapabilities(out int count, out int capabilitySize);
+            return hr >= 0 && count > 0 && capabilitySize > 0;
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"Frame grabber compatibility check failed: {ex.Message}");
+            return false;
+        }
+    }
+
     private void TryCreateFrameGrabber(IFilterGraph filterGraph)
     {
         try
@@ -1037,46 +1136,74 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         catch (Exception ex)
         {
             DiagnosticLog.Write($"Frame grabber is unavailable: {ex}");
-            ReleaseComObject(sampleGrabber);
-            ReleaseComObject(sampleGrabberFilter);
-            sampleGrabber = null;
-            sampleGrabberFilter = null;
-            sampleGrabberFormat = null;
+            RemoveFrameGrabber(filterGraph);
         }
     }
 
     private int RenderVideoStream(IBaseFilter? intermediateFilter)
     {
-        Guid category = DirectShowGuids.PinCategoryPreview;
-        Guid mediaType = DirectShowGuids.MediaTypeVideo;
-        int hr = captureBuilder!.RenderStream(ref category, ref mediaType, sourceFilter!, intermediateFilter, rendererFilter);
+        int hr = RenderStream(
+            DirectShowGuids.PinCategoryPreview,
+            DirectShowGuids.MediaTypeVideo,
+            sourceFilter!,
+            intermediateFilter,
+            rendererFilter);
+        DiagnosticLog.Write($"Video preview-pin render result: 0x{hr:X8}");
         if (hr >= 0)
         {
             return hr;
         }
 
-        category = DirectShowGuids.PinCategoryCapture;
-        mediaType = DirectShowGuids.MediaTypeVideo;
-        return captureBuilder.RenderStream(ref category, ref mediaType, sourceFilter!, intermediateFilter, rendererFilter);
+        hr = RenderStream(
+            DirectShowGuids.PinCategoryCapture,
+            DirectShowGuids.MediaTypeVideo,
+            sourceFilter!,
+            intermediateFilter,
+            rendererFilter);
+        DiagnosticLog.Write($"Video capture-pin render result: 0x{hr:X8}");
+        if (hr >= 0)
+        {
+            return hr;
+        }
+
+        // Virtual cameras do not always expose PIN_CATEGORY_PREVIEW or
+        // PIN_CATEGORY_CAPTURE. A null category lets DirectShow use the
+        // first compatible video output pin.
+        hr = RenderStream(
+            null,
+            DirectShowGuids.MediaTypeVideo,
+            sourceFilter!,
+            intermediateFilter,
+            rendererFilter);
+        DiagnosticLog.Write($"Video uncategorized-pin render result: 0x{hr:X8}");
+        return hr;
     }
 
     private void RemoveFrameGrabber(IFilterGraph filterGraph)
     {
         sampleGrabberFormat = null;
-        ReleaseComObject(sampleGrabber);
         sampleGrabber = null;
 
-        if (sampleGrabberFilter is not null)
+        IBaseFilter? filterToRemove = sampleGrabberFilter;
+        sampleGrabberFilter = null;
+        if (filterToRemove is not null)
         {
-            int removeHr = filterGraph.RemoveFilter(sampleGrabberFilter);
+            int removeHr = filterGraph.RemoveFilter(filterToRemove);
             if (removeHr < 0)
             {
                 DiagnosticLog.Write($"Failed to remove frame grabber after render failure: 0x{removeHr:X8}");
             }
 
-            ReleaseComObject(sampleGrabberFilter);
-            sampleGrabberFilter = null;
+            // sampleGrabber and sampleGrabberFilter are two interfaces on the
+            // same COM object. Release the owning filter RCW only once.
+            ReleaseComObject(filterToRemove);
         }
+    }
+
+    private int RenderVideoStreamWithoutFrameGrabber(IFilterGraph filterGraph)
+    {
+        RemoveFrameGrabber(filterGraph);
+        return RenderVideoStream(null);
     }
 
     private VideoSampleFormat? TryReadFrameGrabberFormat()
@@ -1382,17 +1509,70 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
     private int RenderAudioFromFilter(IBaseFilter filter)
     {
-        Guid audioCategory = DirectShowGuids.PinCategoryCapture;
-        Guid audioType = DirectShowGuids.MediaTypeAudio;
-        int hr = captureBuilder!.RenderStream(ref audioCategory, ref audioType, filter, null, null);
+        int hr = RenderStream(
+            DirectShowGuids.PinCategoryCapture,
+            DirectShowGuids.MediaTypeAudio,
+            filter,
+            null,
+            null);
         if (hr >= 0)
         {
             return hr;
         }
 
-        audioCategory = DirectShowGuids.PinCategoryPreview;
-        audioType = DirectShowGuids.MediaTypeAudio;
-        return captureBuilder.RenderStream(ref audioCategory, ref audioType, filter, null, null);
+        hr = RenderStream(
+            DirectShowGuids.PinCategoryPreview,
+            DirectShowGuids.MediaTypeAudio,
+            filter,
+            null,
+            null);
+        if (hr >= 0)
+        {
+            return hr;
+        }
+
+        return RenderStream(
+            null,
+            DirectShowGuids.MediaTypeAudio,
+            filter,
+            null,
+            null);
+    }
+
+    private int RenderStream(
+        Guid? category,
+        Guid mediaType,
+        object source,
+        IBaseFilter? compressor,
+        IBaseFilter? renderer)
+    {
+        IntPtr categoryPointer = IntPtr.Zero;
+        IntPtr mediaTypePointer = Marshal.AllocCoTaskMem(Marshal.SizeOf<Guid>());
+        try
+        {
+            if (category.HasValue)
+            {
+                categoryPointer = Marshal.AllocCoTaskMem(Marshal.SizeOf<Guid>());
+                Marshal.StructureToPtr(category.Value, categoryPointer, false);
+            }
+
+            Marshal.StructureToPtr(mediaType, mediaTypePointer, false);
+            return captureBuilder!.RenderStream(
+                categoryPointer,
+                mediaTypePointer,
+                source,
+                compressor,
+                renderer);
+        }
+        finally
+        {
+            if (categoryPointer != IntPtr.Zero)
+            {
+                Marshal.FreeCoTaskMem(categoryPointer);
+            }
+
+            Marshal.FreeCoTaskMem(mediaTypePointer);
+        }
     }
 
     private bool ApplyVideoFormat(CaptureFormatOption format)
@@ -1483,16 +1663,35 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         ICaptureGraphBuilder2 builder,
         IBaseFilter source)
     {
-        Guid category = DirectShowGuids.PinCategoryCapture;
-        Guid mediaType = DirectShowGuids.MediaTypeVideo;
         Guid interfaceId = typeof(IAMStreamConfig).GUID;
-        int hr = builder.FindInterface(ref category, ref mediaType, source, ref interfaceId, out IntPtr streamConfigPointer);
+        int hr = FindInterface(
+            builder,
+            DirectShowGuids.PinCategoryCapture,
+            DirectShowGuids.MediaTypeVideo,
+            source,
+            ref interfaceId,
+            out IntPtr streamConfigPointer);
 
         if (hr < 0 || streamConfigPointer == IntPtr.Zero)
         {
-            category = DirectShowGuids.PinCategoryPreview;
-            mediaType = DirectShowGuids.MediaTypeVideo;
-            hr = builder.FindInterface(ref category, ref mediaType, source, ref interfaceId, out streamConfigPointer);
+            hr = FindInterface(
+                builder,
+                DirectShowGuids.PinCategoryPreview,
+                DirectShowGuids.MediaTypeVideo,
+                source,
+                ref interfaceId,
+                out streamConfigPointer);
+        }
+
+        if (hr < 0 || streamConfigPointer == IntPtr.Zero)
+        {
+            hr = FindInterface(
+                builder,
+                null,
+                DirectShowGuids.MediaTypeVideo,
+                source,
+                ref interfaceId,
+                out streamConfigPointer);
         }
 
         CheckHr(hr, "Failed to find video stream configuration.");
@@ -1504,6 +1703,43 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         finally
         {
             Marshal.Release(streamConfigPointer);
+        }
+    }
+
+    private static int FindInterface(
+        ICaptureGraphBuilder2 builder,
+        Guid? category,
+        Guid mediaType,
+        IBaseFilter source,
+        ref Guid interfaceId,
+        out IntPtr value)
+    {
+        IntPtr categoryPointer = IntPtr.Zero;
+        IntPtr mediaTypePointer = Marshal.AllocCoTaskMem(Marshal.SizeOf<Guid>());
+        try
+        {
+            if (category.HasValue)
+            {
+                categoryPointer = Marshal.AllocCoTaskMem(Marshal.SizeOf<Guid>());
+                Marshal.StructureToPtr(category.Value, categoryPointer, false);
+            }
+
+            Marshal.StructureToPtr(mediaType, mediaTypePointer, false);
+            return builder.FindInterface(
+                categoryPointer,
+                mediaTypePointer,
+                source,
+                ref interfaceId,
+                out value);
+        }
+        finally
+        {
+            if (categoryPointer != IntPtr.Zero)
+            {
+                Marshal.FreeCoTaskMem(categoryPointer);
+            }
+
+            Marshal.FreeCoTaskMem(mediaTypePointer);
         }
     }
 
@@ -1546,6 +1782,7 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         }
 
         return formats
+            .Where(format => format.Subtype is not ("P010" or "NV12"))
             .OrderBy(format => format.Width)
             .ThenBy(format => format.Height)
             .ThenBy(format => format.Subtype)
@@ -2714,12 +2951,12 @@ internal interface ICaptureGraphBuilder2
         out IntPtr sink);
 
     [PreserveSig]
-    int FindInterface(ref Guid category, ref Guid type, IBaseFilter filter, ref Guid interfaceId, out IntPtr value);
+    int FindInterface(IntPtr category, IntPtr type, IBaseFilter filter, ref Guid interfaceId, out IntPtr value);
 
     [PreserveSig]
     int RenderStream(
-        ref Guid category,
-        ref Guid type,
+        IntPtr category,
+        IntPtr type,
         [MarshalAs(UnmanagedType.IUnknown)] object source,
         IBaseFilter? compressor,
         IBaseFilter? renderer);
