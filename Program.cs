@@ -1032,6 +1032,15 @@ internal sealed class DirectShowPreviewGraph : IDisposable
                 FormatName = format.DisplayName;
             }
         }
+        else if (IsObsVirtualCamera(deviceName))
+        {
+            CaptureFormatOption? obsFormat = TryApplyObsVirtualCameraFormat();
+            if (obsFormat is not null)
+            {
+                CaptureSize = obsFormat.Size;
+                FormatName = obsFormat.DisplayName;
+            }
+        }
 
         DiagnosticLog.Write("Creating VideoRenderer.");
         rendererFilter = CreateComObject<IBaseFilter>(DirectShowGuids.VideoRenderer);
@@ -1090,6 +1099,151 @@ internal sealed class DirectShowPreviewGraph : IDisposable
 
         DiagnosticLog.Write("Running graph.");
         CheckHr(mediaControl.Run(), "Failed to start the video capture device.");
+    }
+
+    private static bool IsObsVirtualCamera(string deviceName) =>
+        deviceName.Contains("OBS Virtual Camera", StringComparison.OrdinalIgnoreCase);
+
+    private CaptureFormatOption? TryApplyObsVirtualCameraFormat()
+    {
+        try
+        {
+            using ComReleaser<IAMStreamConfig> streamConfig =
+                FindVideoStreamConfig(captureBuilder!, sourceFilter!);
+            int hr = streamConfig.Value.GetFormat(out IntPtr mediaTypePointer);
+            if (hr < 0 || mediaTypePointer == IntPtr.Zero)
+            {
+                DiagnosticLog.Write($"Failed to read OBS virtual camera format: 0x{hr:X8}");
+                return null;
+            }
+
+            try
+            {
+                AMMediaType mediaType = Marshal.PtrToStructure<AMMediaType>(mediaTypePointer);
+                if (mediaType.FormatType != DirectShowGuids.FormatVideoInfo ||
+                    mediaType.FormatPointer == IntPtr.Zero)
+                {
+                    DiagnosticLog.Write(
+                        "OBS virtual camera has no initialized media type. " +
+                        "Using a 1920x1080 60fps YUY2 fallback.");
+                    ReleaseMediaType(mediaTypePointer);
+                    mediaTypePointer = IntPtr.Zero;
+                    mediaTypePointer = CreateYuy2MediaType(1920, 1080, 10_000_000L / 60);
+                    mediaType = Marshal.PtrToStructure<AMMediaType>(mediaTypePointer);
+                }
+
+                VideoInfoHeader videoInfo =
+                    Marshal.PtrToStructure<VideoInfoHeader>(mediaType.FormatPointer);
+                int width = Math.Abs(videoInfo.BitmapInfoHeader.Width);
+                int height = Math.Abs(videoInfo.BitmapInfoHeader.Height);
+                if (width <= 0 || height <= 0)
+                {
+                    DiagnosticLog.Write("OBS virtual camera returned an invalid video size.");
+                    return null;
+                }
+
+                int imageSize = checked(width * height * 2);
+                videoInfo.BitmapInfoHeader.Planes = 1;
+                videoInfo.BitmapInfoHeader.BitCount = 16;
+                videoInfo.BitmapInfoHeader.Compression = FourCc("YUY2");
+                videoInfo.BitmapInfoHeader.SizeImage = imageSize;
+                videoInfo.BitRate = videoInfo.AverageTimePerFrame > 0
+                    ? checked((int)Math.Min(
+                        int.MaxValue,
+                        imageSize * 8L * 10_000_000L / videoInfo.AverageTimePerFrame))
+                    : 0;
+
+                mediaType.SubType = DirectShowGuids.MediaSubtypeYuy2;
+                mediaType.FixedSizeSamples = true;
+                mediaType.TemporalCompression = false;
+                mediaType.SampleSize = imageSize;
+                Marshal.StructureToPtr(videoInfo, mediaType.FormatPointer, false);
+                Marshal.StructureToPtr(mediaType, mediaTypePointer, false);
+
+                CheckHr(
+                    streamConfig.Value.SetFormat(mediaTypePointer),
+                    "Failed to select the OBS virtual camera YUY2 format.");
+
+                CaptureFormatOption? applied = TryCreateFormatOption(-1, mediaTypePointer);
+                DiagnosticLog.Write(
+                    $"OBS virtual camera format selected: {applied?.DisplayName ?? "YUY2"}");
+                return applied;
+            }
+            finally
+            {
+                ReleaseMediaType(mediaTypePointer);
+            }
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write($"Failed to select an OBS-compatible video format: {ex}");
+            return null;
+        }
+    }
+
+    private static IntPtr CreateYuy2MediaType(int width, int height, long averageTimePerFrame)
+    {
+        int imageSize = checked(width * height * 2);
+        var videoInfo = new VideoInfoHeader
+        {
+            Source = new NativeRect { Right = width, Bottom = height },
+            Target = new NativeRect { Right = width, Bottom = height },
+            BitRate = averageTimePerFrame > 0
+                ? checked((int)Math.Min(
+                    int.MaxValue,
+                    imageSize * 8L * 10_000_000L / averageTimePerFrame))
+                : 0,
+            AverageTimePerFrame = averageTimePerFrame,
+            BitmapInfoHeader = new BitmapInfoHeader
+            {
+                Size = Marshal.SizeOf<BitmapInfoHeader>(),
+                Width = width,
+                Height = height,
+                Planes = 1,
+                BitCount = 16,
+                Compression = FourCc("YUY2"),
+                SizeImage = imageSize,
+            },
+        };
+
+        IntPtr formatPointer = Marshal.AllocCoTaskMem(Marshal.SizeOf<VideoInfoHeader>());
+        IntPtr mediaTypePointer = IntPtr.Zero;
+        bool ownershipTransferred = false;
+        try
+        {
+            Marshal.StructureToPtr(videoInfo, formatPointer, false);
+            var mediaType = new AMMediaType
+            {
+                MajorType = DirectShowGuids.MediaTypeVideo,
+                SubType = DirectShowGuids.MediaSubtypeYuy2,
+                FixedSizeSamples = true,
+                TemporalCompression = false,
+                SampleSize = imageSize,
+                FormatType = DirectShowGuids.FormatVideoInfo,
+                FormatSize = Marshal.SizeOf<VideoInfoHeader>(),
+                FormatPointer = formatPointer,
+            };
+
+            mediaTypePointer = Marshal.AllocCoTaskMem(Marshal.SizeOf<AMMediaType>());
+            Marshal.StructureToPtr(mediaType, mediaTypePointer, false);
+            ownershipTransferred = true;
+            return mediaTypePointer;
+        }
+        finally
+        {
+            if (!ownershipTransferred)
+            {
+                if (formatPointer != IntPtr.Zero)
+                {
+                    Marshal.FreeCoTaskMem(formatPointer);
+                }
+
+                if (mediaTypePointer != IntPtr.Zero)
+                {
+                    Marshal.FreeCoTaskMem(mediaTypePointer);
+                }
+            }
+        }
     }
 
     private bool CanUseFrameGrabber(CaptureFormatOption? format)
@@ -1863,6 +2017,19 @@ internal sealed class DirectShowPreviewGraph : IDisposable
         return chars.All(static c => c >= 32 && c <= 126) ? new string(chars) : string.Empty;
     }
 
+    private static int FourCc(string value)
+    {
+        if (value.Length != 4)
+        {
+            throw new ArgumentException("A FourCC value must contain exactly four characters.", nameof(value));
+        }
+
+        return value[0] |
+            (value[1] << 8) |
+            (value[2] << 16) |
+            (value[3] << 24);
+    }
+
     private static void ReleaseMediaType(IntPtr mediaTypePointer)
     {
         if (mediaTypePointer == IntPtr.Zero)
@@ -2323,6 +2490,7 @@ internal static class DirectShowGuids
     public static readonly Guid CreateDevEnum = new("62BE5D10-60EB-11D0-BD3B-00A0C911CE86");
     public static readonly Guid VideoRenderer = new("70E102B0-5556-11CE-97C0-00AA0055595A");
     public static readonly Guid SampleGrabber = new("C1F400A0-3F08-11D3-9F0B-006008039E37");
+    public static readonly Guid MediaSubtypeYuy2 = new("32595559-0000-0010-8000-00AA00389B71");
     public static readonly Guid MediaSubtypeRgb24 = new("E436EB7D-524F-11CE-9F53-0020AF0BA770");
     public static readonly Guid MediaSubtypeRgb32 = new("E436EB7E-524F-11CE-9F53-0020AF0BA770");
 
