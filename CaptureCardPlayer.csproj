@@ -6,6 +6,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>CaptureCardPlayer</AssemblyName>
+    <ApplicationIcon>Assets\CaptureCardPlayer.ico</ApplicationIcon>
     <RootNamespace>CaptureCardPlayer</RootNamespace>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
