@@ -179,6 +179,8 @@ internal sealed class PreviewForm : Form
 
         KeyPreview = true;
         Text = "CaptureCardPlayer";
+        Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath)
+            ?? System.Drawing.SystemIcons.Application;
         BackColor = Color.Black;
         ClientSize = new Size(1280, 720);
         MinimumSize = new Size(320, 180);
